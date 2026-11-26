@@ -28,6 +28,7 @@ The bot was rewritten from Python to Rust. Versions 1.x are the old Python bot, 
 
 ### Changed
 
+- License changed from GPL-3.0-or-later to CC BY-NC-SA 4.0 (Attribution-NonCommercial-ShareAlike 4.0 International).
 - New database schema with Unix timestamps, one row per station and automatic versioned migrations. Old column names stay available through read-only views.
 - All messages go through one persistent queue that respects Telegram limits; stale "free" notifications are dropped instead of being sent late.
 - `/status` answers from the monitor cache and shows how fresh the data is.

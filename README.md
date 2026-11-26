@@ -8,7 +8,7 @@
 
 [![Release](https://img.shields.io/github/v/release/Mahiron-hq/drova-bot?style=flat-square)](https://github.com/Mahiron-hq/drova-bot/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/Mahiron-hq/drova-bot/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/Mahiron-hq/drova-bot/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-blue?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20server-555?style=flat-square)](#installation)
 [![Rust](https://img.shields.io/badge/rust-1.99-orange?style=flat-square)](https://www.rust-lang.org)
 
@@ -22,7 +22,7 @@
 |---|---|
 | Bot | [@drova_servers_bot](https://t.me/drova_servers_bot) |
 | Platform | Linux x86_64 server (static binary), any systemd distribution |
-| License | GPL-3.0-or-later |
+| License | CC BY-NC-SA 4.0 |
 | Download | [Releases](https://github.com/Mahiron-hq/drova-bot/releases/latest) |
 | Language | Russian (bot interface) |
 
@@ -67,9 +67,9 @@ Merchants get a message when a station is free but still hidden from players, ca
 
 One static binary without OpenSSL, SQLite with automatic versioned migrations and a backup before each migration, a systemd watchdog, a persistent message queue that respects Telegram limits, and admin alerts when the Drova API fails.
 
-#### 6. Open source and little data
+#### 6. Public source code and little data
 
-The source code is open under GPL-3.0-or-later. The bot stores only your Telegram ID, subscriptions, comments and settings, and `/forget` deletes all of it at once.
+The source code is public under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/): you may use, change and share it for non-commercial purposes, with attribution and under the same license. The bot stores only your Telegram ID, subscriptions, comments and settings, and `/forget` deletes all of it at once.
 
 ### What the bot can do
 
@@ -174,11 +174,11 @@ The bot stores only Telegram IDs, subscriptions, comments and settings, keeps se
 
 The bot is provided "as is", without warranty. A message may come late or not at all if Drova or Telegram are unavailable.
 
-Drova Bot is an independent open source project. It is not affiliated with or endorsed by Drova. The name Drova is used only to indicate what the bot works with.
+Drova Bot is an independent project with public source code. It is not affiliated with or endorsed by Drova. The name Drova is used only to indicate what the bot works with.
 
 ### License
 
-GPL-3.0-or-later, see [LICENSE](LICENSE). Reporting a vulnerability: [SECURITY.md](SECURITY.md). Changes: [CHANGELOG.md](CHANGELOG.md). The Python version: [`python`](https://github.com/Mahiron-hq/drova-bot/tree/python) branch.
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) (Attribution-NonCommercial-ShareAlike 4.0 International), see [LICENSE](LICENSE). Reporting a vulnerability: [SECURITY.md](SECURITY.md). Changes: [CHANGELOG.md](CHANGELOG.md). The Python version: [`python`](https://github.com/Mahiron-hq/drova-bot/tree/python) branch.
 
 If the bot is useful to you, a star on GitHub helps the project.
 
@@ -225,7 +225,7 @@ Drova Bot следит за станциями сервиса облачного
 
 #### 6. Открытый код и минимум данных
 
-Исходный код открыт под лицензией GPL-3.0-or-later. Бот хранит только ваш Telegram ID, подписки, комментарии и настройки, а `/forget` удаляет всё сразу.
+Исходный код открыт под лицензией [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/): его можно использовать, изменять и распространять в некоммерческих целях с указанием автора и под той же лицензией. Бот хранит только ваш Telegram ID, подписки, комментарии и настройки, а `/forget` удаляет всё сразу.
 
 ### Что умеет бот
 
@@ -334,7 +334,7 @@ Drova Bot – независимый проект с открытым кодом
 
 ### Лицензия
 
-GPL-3.0-or-later, см. [LICENSE](LICENSE). Сообщить об уязвимости: [SECURITY.md](SECURITY.md). История изменений: [CHANGELOG.md](CHANGELOG.md). Версия на Python: ветка [`python`](https://github.com/Mahiron-hq/drova-bot/tree/python).
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) (Attribution-NonCommercial-ShareAlike 4.0 International), см. [LICENSE](LICENSE). Сообщить об уязвимости: [SECURITY.md](SECURITY.md). История изменений: [CHANGELOG.md](CHANGELOG.md). Версия на Python: ветка [`python`](https://github.com/Mahiron-hq/drova-bot/tree/python).
 
 Если бот вам полезен, поставьте звезду репозиторию на GitHub, это помогает проекту.
 

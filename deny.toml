@@ -20,7 +20,7 @@ allow = [
     "Unlicense",
     "MPL-2.0",
     "CDLA-Permissive-2.0",
-    "GPL-3.0-or-later",
+    "CC-BY-NC-SA-4.0",
 ]
 
 [bans]
