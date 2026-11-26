@@ -1,0 +1,51 @@
+[Unit]
+Description=Drova Telegram bot
+Documentation=https://github.com/Mahiron-hq/drova-bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=drova-bot
+Group=drova-bot
+WorkingDirectory=/var/lib/drova-bot
+EnvironmentFile=/etc/drova-bot/drova-bot.env
+ExecStart=/usr/local/bin/drova-bot run
+Restart=always
+RestartSec=5
+WatchdogSec=300
+TimeoutStopSec=45
+SyslogIdentifier=drova-bot
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/drova-bot
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

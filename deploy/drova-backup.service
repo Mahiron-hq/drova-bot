@@ -1,0 +1,6 @@
+[Unit]
+Description=Daily backup of the Drova bot database
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/drova-backup

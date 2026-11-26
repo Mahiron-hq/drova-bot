@@ -1,0 +1,57 @@
+[package]
+name = "drova-bot"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Telegram bot that watches Drova stations and notifies when they become free"
+authors = ["Lev Burmistrov (Mahiron-hq)"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Mahiron-hq/drova-bot"
+readme = "README.md"
+keywords = ["telegram", "bot", "drova", "monitoring"]
+categories = ["command-line-utilities"]
+publish = false
+
+[dependencies]
+anyhow = "1.0.105"
+dotenvy = "0.15.7"
+jiff = { version = "1.0.3", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "multipart"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "migrate"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "ansi"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+single_match_else = "allow"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"

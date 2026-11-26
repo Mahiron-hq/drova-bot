@@ -1,0 +1,18 @@
+#!/bin/sh
+# Daily consistent copy of the bot database; keeps the newest $KEEP copies.
+set -eu
+
+SRC=${SRC:-/var/lib/drova-bot/drova_monitor.sqlite3}
+DIR=${DIR:-/var/backups/drova-bot}
+KEEP=${KEEP:-7}
+
+install -d -m 750 "$DIR"
+OUT="$DIR/drova-$(date +%F).sqlite3"
+TMP="$OUT.tmp"
+rm -f "$TMP"
+sqlite3 "$SRC" ".backup '$TMP'"
+sqlite3 "$TMP" 'PRAGMA journal_mode=DELETE' >/dev/null
+[ "$(sqlite3 "$TMP" 'PRAGMA integrity_check')" = ok ]
+chmod 640 "$TMP"
+mv -f "$TMP" "$OUT"
+ls -1t "$DIR"/drova-*.sqlite3 | tail -n +$((KEEP + 1)) | xargs -r rm -f --
