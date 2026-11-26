@@ -41,6 +41,7 @@ The data is stored on a server in Switzerland. It is not sold or shared with any
 
 - `/forget` deletes all your data at once (daily backups expire within 7 days).
 - `/export` gives you your subscriptions with comments as a file.
+- On your personal request, all data the bot has stored about you can be fully erased.
 - For any question about your data, write to the contact above.
 
 ### Changes
@@ -84,7 +85,9 @@ Changes to this policy are published in this file; its history is visible in the
 
 - `/forget` сразу удаляет все ваши данные (из резервных копий они исчезнут в течение 7 дней).
 - `/export` выгружает ваши подписки с комментариями в файл.
+- По вашему личному запросу доступна полная очистка памяти бота от сохранённых данных о вас.
 - По любым вопросам о ваших данных пишите на контакты выше.
+
 
 ### Изменения
 

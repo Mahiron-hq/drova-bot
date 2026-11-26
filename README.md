@@ -73,8 +73,8 @@ The source code is public under [CC BY-NC-SA 4.0](https://creativecommons.org/li
 
 ### What the bot can do
 
-- **Notifications:** a station became free or came back online, with the game of the last session and how long it lasted; the message updates itself if the station is taken again within 5 minutes.
-- **Status and list:** `/status` and `/list` show every subscription with an icon, the waiting count and the current game of busy stations. The data is never older than one polling round.
+- **Notifications:** when a station became free or came back online, with the game of the last session and how long it lasted; the message updates itself if the station is taken again within 5 minutes.
+- **Status and list:** `/status` and `/list` show every subscription with an icon, the waiting count and the current game of busy stations. Only bot users are counted as waiting. The data is never older than one polling round.
 - **Station card:** history, comment, share link, removal, a link to drova.io, hardware and description.
 - **History:** status changes for the last 24 hours with games for everyone; 7-day statistics for merchants and the admin.
 - **Deleted stations:** if Drova answers "not found" for an hour, the bot asks whether to remove the station. A deleted station is checked once an hour; if it comes back, you get a message; if not, the subscription is removed after 30 days.
@@ -161,7 +161,7 @@ All settings come from environment variables (or a `.env` file in the working di
 
 ### Limitations
 
-- The bot uses only the public Drova API. Session history, earnings and other data of a merchant account are not available to it.
+- The bot uses only the public Drova API. Session history, earnings and other data of a merchant account are not available to it at the moment.
 - A status change reaches you within one polling round (30 seconds by default) plus Telegram delivery time.
 - While a client is connecting (up to 2-3 minutes), the station is already shown as busy, even if the connection fails later.
 - The bot interface is in Russian only.
@@ -229,8 +229,8 @@ Drova Bot следит за станциями сервиса облачного
 
 ### Что умеет бот
 
-- **Уведомления:** станция освободилась или вернулась из офлайна, с игрой последней сессии и её длительностью; сообщение само обновится, если станцию займут в течение 5 минут.
-- **Статус и список:** `/status` и `/list` показывают все подписки со значком, числом ожидающих и текущей игрой у занятых станций. Данные не старше одного цикла опроса.
+- **Уведомления:** когда станция освободилась или вернулась из офлайна, с игрой последней сессии и её длительностью; сообщение само обновится, если станцию займут в течение 5 минут.
+- **Статус и список:** `/status` и `/list` показывают все подписки со значком, числом ожидающих и текущей игрой у занятых станций. Ожидающие считаются только по пользователям бота. Данные не старше одного цикла опроса.
 - **Карточка станции:** история, комментарий, ссылка «поделиться», удаление, ссылка на drova.io, железо и описание.
 - **История:** смены статуса за 24 часа с играми для всех; статистика за 7 дней для мерчантов и админа.
 - **Удалённые станции:** если Drova час отвечает «не найдена», бот спросит, удалить ли станцию. Удалённая станция проверяется раз в час. Если она вернётся, придёт сообщение, если нет, подписка удалится через 30 дней.
@@ -317,7 +317,7 @@ cargo test
 
 ### Ограничения
 
-- Бот использует только публичное API Drova. История сессий, доходы и другие данные аккаунта мерчанта ему недоступны.
+- Бот использует только публичное API Drova. История сессий, доходы и другие данные аккаунта мерчанта на данный момент ему недоступны.
 - Смена статуса доходит до вас за один цикл опроса (по умолчанию 30 секунд) плюс время доставки Telegram.
 - Пока клиент подключается (до 2-3 минут), станция уже показывается занятой, даже если подключение потом сорвётся.
 - Интерфейс бота только на русском языке.
