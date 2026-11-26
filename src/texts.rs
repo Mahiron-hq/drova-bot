@@ -250,7 +250,9 @@ pub fn list(items: &[SubView<'_>], limit: i64, muted: bool) -> String {
         if st.status != Status::Ready {
             let _ = write!(out, "\n{}", waiting_line(v.waiting));
         }
-        if let Some(g) = game_line(st.status, v.game) {
+        if st.status == Status::Busy
+            && let Some(g) = game_line(st.status, v.game)
+        {
             let _ = write!(out, "\n{g}");
         }
         if let Some(c) = &v.sub.comment {
@@ -281,7 +283,9 @@ pub fn status(items: &[SubView<'_>], now: i64) -> String {
         if st.status != Status::Ready {
             let _ = write!(out, "\n{}", waiting_line(v.waiting));
         }
-        if let Some(g) = game_line(st.status, v.game) {
+        if st.status == Status::Busy
+            && let Some(g) = game_line(st.status, v.game)
+        {
             let _ = write!(out, "\n{g}");
         }
         out.push('\n');

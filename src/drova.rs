@@ -36,18 +36,13 @@ impl Status {
         }
     }
 
-    /// Maps a raw Drova state. Unknown states count as offline, the flag tells the caller.
+    /// Maps a raw Drova state the same way drova.io does. Unknown states count as offline,
+    /// the flag tells the caller.
     pub fn from_raw(raw: &str) -> (Self, bool) {
         match raw.trim().to_ascii_uppercase().as_str() {
-            "READY" | "LISTEN" | "FREE" | "AVAILABLE" | "IDLE" | "ONLINE" | "OPEN" => {
-                (Self::Ready, true)
-            }
-            "BUSY" | "HANDSHAKE" | "OCCUPIED" | "PLAYING" | "IN_SESSION" | "RESERVED" | "TAKEN" => {
-                (Self::Busy, true)
-            }
-            "OFFLINE" | "DISCONNECTED" | "UNAVAILABLE" | "MAINTENANCE" | "DOWN" | "INACTIVE" => {
-                (Self::Offline, true)
-            }
+            "LISTEN" => (Self::Ready, true),
+            "BUSY" | "HANDSHAKE" => (Self::Busy, true),
+            "OFFLINE" => (Self::Offline, true),
             _ => (Self::Offline, false),
         }
     }
@@ -289,5 +284,7 @@ mod tests {
         assert!(s.published);
         assert_eq!(s.product_id, None);
         assert_eq!(Status::from_raw("handshake").0, Status::Busy);
+        assert_eq!(Status::from_raw("LISTEN"), (Status::Ready, true));
+        assert_eq!(Status::from_raw("FREE"), (Status::Offline, false));
     }
 }

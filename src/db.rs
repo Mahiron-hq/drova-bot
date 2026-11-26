@@ -116,6 +116,8 @@ pub struct Applied {
     pub status_changed: bool,
     /// A new game started while the station stayed busy.
     pub game_changed_while_busy: bool,
+    /// Drova reported BUSY after another state or with a new game; HANDSHAKE alone does not count.
+    pub session_started: bool,
 }
 
 #[derive(Debug, Default)]
@@ -397,20 +399,27 @@ impl Db {
 
     pub async fn apply_snapshot(&self, snap: &Snapshot, now: i64) -> Result<Applied> {
         let mut tx = self.pool.begin().await?;
-        let old = sqlx::query("SELECT * FROM stations WHERE uuid = ?")
+        let old_row = sqlx::query("SELECT * FROM stations WHERE uuid = ?")
             .bind(&snap.uuid)
             .fetch_optional(&mut *tx)
-            .await?
+            .await?;
+        let prev_state: Option<String> = old_row
             .as_ref()
-            .map(|r| station_row(r, ""))
+            .map(|r| r.try_get("raw_state"))
             .transpose()?;
+        let old = old_row.as_ref().map(|r| station_row(r, "")).transpose()?;
         let status_changed = old.as_ref().is_none_or(|o| o.status != snap.status);
         let game_changed_while_busy = old.as_ref().is_some_and(|o| {
             o.status == crate::drova::Status::Busy
                 && snap.status == crate::drova::Status::Busy
+                && o.product_id.is_some()
                 && snap.product_id.is_some()
                 && o.product_id != snap.product_id
         });
+        let session_started = snap.raw_state.eq_ignore_ascii_case("BUSY")
+            && prev_state
+                .as_deref()
+                .is_some_and(|r| !r.eq_ignore_ascii_case("BUSY") || game_changed_while_busy);
         let status_since = match &old {
             Some(o) if !status_changed => o.status_since,
             _ => now,
@@ -459,6 +468,7 @@ impl Db {
             new,
             status_changed,
             game_changed_while_busy,
+            session_started,
         })
     }
 
@@ -1163,10 +1173,14 @@ mod tests {
     use crate::drova::Snapshot;
 
     fn snap(status: Status, product: Option<&str>) -> Snapshot {
+        snap_raw(status, product, "X")
+    }
+
+    fn snap_raw(status: Status, product: Option<&str>, raw: &str) -> Snapshot {
         Snapshot {
             uuid: "05225c83-dd3b-4c12-832b-48227262f960".into(),
             name: "PC".into(),
-            raw_state: "X".into(),
+            raw_state: raw.into(),
             status,
             known_state: true,
             published: true,
@@ -1207,6 +1221,28 @@ mod tests {
         let (game, len) = db.last_session(&a.new.uuid).await.unwrap().unwrap();
         assert_eq!(game.as_deref(), Some("g2"));
         assert_eq!(len, 140);
+    }
+
+    #[tokio::test]
+    async fn session_start_and_unknown_old_game() {
+        let db = memory().await;
+        let apply = |s: Snapshot, t: i64| {
+            let db = db.clone();
+            async move { db.apply_snapshot(&s, t).await.unwrap() }
+        };
+        apply(snap_raw(Status::Busy, None, "BUSY"), 10).await;
+        let a = apply(snap_raw(Status::Busy, Some("g1"), "BUSY"), 20).await;
+        assert!(!a.game_changed_while_busy && !a.session_started);
+        let a = apply(snap_raw(Status::Ready, Some("g1"), "LISTEN"), 30).await;
+        assert!(!a.session_started);
+        let a = apply(snap_raw(Status::Busy, Some("g2"), "HANDSHAKE"), 40).await;
+        assert!(a.status_changed && !a.session_started);
+        let a = apply(snap_raw(Status::Busy, Some("g2"), "BUSY"), 50).await;
+        assert!(!a.status_changed && a.session_started);
+        let a = apply(snap_raw(Status::Busy, Some("g2"), "BUSY"), 60).await;
+        assert!(!a.session_started);
+        let a = apply(snap_raw(Status::Busy, Some("g3"), "BUSY"), 70).await;
+        assert!(a.game_changed_while_busy && a.session_started);
     }
 
     #[tokio::test]

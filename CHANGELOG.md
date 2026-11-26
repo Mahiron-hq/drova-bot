@@ -8,7 +8,7 @@ First public release. The bot was rewritten from Python to Rust.
 
 ### Added
 
-- Game of the last session in notifications, `/status`, `/list`, station cards and `/history`; session length in "free" notifications.
+- Current game of busy stations in `/status` and `/list`; game of the last session in notifications, station cards and `/history`; session length in "free" notifications.
 - Station card in `/list` with history, comment, share link, removal and a link to drova.io.
 - Merchant alerts per station: "session started" with the game and "station went offline".
 - Merchant and admin statistics for 7 days: load, sessions, idle time, peak hours, top games.

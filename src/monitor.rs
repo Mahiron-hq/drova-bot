@@ -228,31 +228,35 @@ impl Monitor {
     async fn on_taken(&self, a: &Applied, t: i64) -> Result<()> {
         let st = &a.new;
         self.app.db.set_station_waiting(&st.uuid, st.status).await?;
+        let Some(old) = &a.old else {
+            return Ok(());
+        };
         let fresh = a.status_changed || a.game_changed_while_busy;
-        if !fresh || a.old.is_none() {
+        let session_started = a.session_started;
+        if !fresh && !session_started {
             return Ok(());
         }
         let game = match &st.product_id {
             Some(p) if st.status == Status::Busy => self.app.title(p).await,
             _ => None,
         };
-        let suffix = texts::taken_suffix(st.status, game.as_deref());
-        for (_, chat, message_id, text) in self
-            .app
-            .db
-            .take_recent_free_messages(&st.uuid, TAKEN_WINDOW, t)
-            .await?
-        {
-            let edited = texts::mark_taken(&text, &suffix);
-            match self.app.tg.edit(chat, message_id, &edited, None).await {
-                Ok(()) | Err(TgError::Suppressed) => {}
-                Err(TgError::Forbidden(_)) => self.app.db.mark_blocked(chat, t).await?,
-                Err(e) => tracing::debug!(chat, error = %e, "cannot edit free message"),
+        if fresh {
+            let suffix = texts::taken_suffix(st.status, game.as_deref());
+            for (_, chat, message_id, text) in self
+                .app
+                .db
+                .take_recent_free_messages(&st.uuid, TAKEN_WINDOW, t)
+                .await?
+            {
+                let edited = texts::mark_taken(&text, &suffix);
+                match self.app.tg.edit(chat, message_id, &edited, None).await {
+                    Ok(()) | Err(TgError::Suppressed) => {}
+                    Err(TgError::Forbidden(_)) => self.app.db.mark_blocked(chat, t).await?,
+                    Err(e) => tracing::debug!(chat, error = %e, "cannot edit free message"),
+                }
             }
         }
-        let went_offline = st.status == Status::Offline
-            && a.old.as_ref().is_some_and(|o| o.status != Status::Offline);
-        let session_started = st.status == Status::Busy;
+        let went_offline = st.status == Status::Offline && old.status != Status::Offline;
         if !went_offline && !session_started {
             return Ok(());
         }
