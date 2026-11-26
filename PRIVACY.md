@@ -22,7 +22,7 @@ Only what the bot needs to work:
 
 The bot does not store your name, username, phone number, profile photo or the content of your messages other than comments and the data listed above. The bot does not use analytics or advertising trackers.
 
-Public data about Drova stations (name, status, city, game of the last session) is collected from the public Drova API and is not personal data of bot users.
+Public data about Drova stations (name, status, city, description, hardware, game of the last session) is collected from the public Drova API and is not personal data of bot users.
 
 ### Why
 
@@ -65,7 +65,7 @@ Changes to this policy are published in this file; its history is visible in the
 
 Бот не хранит ваше имя, username, номер телефона, фото профиля и содержимое сообщений, кроме комментариев и данных из списка выше. Бот не использует аналитику и рекламные трекеры.
 
-Публичные данные о станциях Drova (название, статус, город, игра последней сессии) берутся из публичного API Drova и не являются персональными данными пользователей бота.
+Публичные данные о станциях Drova (название, статус, город, описание, железо, игра последней сессии) берутся из публичного API Drova и не являются персональными данными пользователей бота.
 
 ### Зачем
 
