@@ -5,15 +5,16 @@ use std::fmt::Write as _;
 
 use jiff::tz::TimeZone;
 
-use crate::db::{StationRow, Stats, SubRow, UserRow};
-use crate::drova::Status;
+use crate::db::{GONE_KEEP_DAYS, StationRow, Stats, SubRow, UserRow};
+use crate::drova::{Hardware, Status};
 use crate::history::{Interval, Stats as HStats};
 use crate::tz;
-use crate::util::{format_duration, html, station_url, users_count};
+use crate::util::{format_duration, html, plural, station_url, users_count};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPO: &str = env!("CARGO_PKG_REPOSITORY");
 pub const COMMENT_MAX: usize = 500;
+pub const DESCRIPTION_MAX: usize = 500;
 const MAX_HISTORY_LINES: usize = 60;
 
 pub fn privacy_url() -> String {
@@ -67,6 +68,30 @@ fn status_icon(s: Status, published: bool) -> &'static str {
         Status::Busy => "⏳",
         Status::Offline => "🔴",
     }
+}
+
+const GONE_ICON: &str = "❌";
+const GONE_WORD: &str = "удалена с Drova";
+
+fn station_icon(st: &StationRow) -> &'static str {
+    if st.gone_at.is_some() {
+        GONE_ICON
+    } else {
+        status_icon(st.status, st.published)
+    }
+}
+
+fn days_left(gone_at: i64, now: i64) -> i64 {
+    let left = gone_at + GONE_KEEP_DAYS * 86_400 - now;
+    (left + 86_399).div_euclid(86_400).max(1)
+}
+
+fn gone_note(st: &StationRow, now: i64) -> String {
+    let left = st.gone_at.map_or(GONE_KEEP_DAYS, |g| days_left(g, now));
+    format!(
+        "Станция не найдена на Drova. Если не вернётся, подписка удалится через {left} {}.",
+        plural(left, "день", "дня", "дней")
+    )
 }
 
 pub fn welcome(max_user: i64) -> String {
@@ -159,7 +184,8 @@ pub fn help(max_user: i64, max_merchant: i64) -> String {
          <b>Тихие часы</b> – в выбранное время уведомления приходят без звука. Время считается \
          в вашем часовом поясе (/settings).\n\n\
          <b>Статусы</b>\n🟢 готов – можно подключаться\n⏳ занят – кто-то уже в сессии\n\
-         🔴 недоступен – станция не в сети\n🔒 свободна, но скрыта – видят только мерчанты\n\n\
+         🔴 недоступен – станция не в сети\n🔒 свободна, но скрыта – видят только мерчанты\n\
+         ❌ удалена с Drova – станция не найдена, бот предложит убрать её из подписок\n\n\
          <b>История.</b> Всем видны переходы статуса за 24 часа с играми. Мерчантам и админу ещё \
          статистика за 7 дней: загрузка, сессии, простой, пиковые часы и топ игр.\n\n\
          Нравится бот? Поставьте ⭐ репозиторию на GitHub: {REPO}{}",
@@ -226,7 +252,7 @@ pub struct SubView<'a> {
     pub waiting: i64,
 }
 
-pub fn list(items: &[SubView<'_>], limit: i64, muted: bool) -> String {
+pub fn list(items: &[SubView<'_>], limit: i64, muted: bool, now: i64) -> String {
     let mut out = format!(
         "<b>Ваши подписки: {}/{limit}</b>\nРежим тишины: {}\n",
         items.len(),
@@ -238,6 +264,20 @@ pub fn list(items: &[SubView<'_>], limit: i64, muted: bool) -> String {
     );
     for (i, v) in items.iter().enumerate() {
         let st = &v.sub.station;
+        if st.gone_at.is_some() {
+            let _ = write!(
+                out,
+                "\n{}. {GONE_ICON} <b>{}</b> – {GONE_WORD}\n{}",
+                i + 1,
+                html(&st.name),
+                gone_note(st, now)
+            );
+            if let Some(c) = &v.sub.comment {
+                let _ = write!(out, "\n💬 {}", html(c));
+            }
+            out.push('\n');
+            continue;
+        }
         let _ = write!(
             out,
             "\n{}. {} <b>{}</b> – {}\n{}",
@@ -269,6 +309,15 @@ pub fn status(items: &[SubView<'_>], now: i64) -> String {
     let mut oldest: Option<i64> = None;
     for (i, v) in items.iter().enumerate() {
         let st = &v.sub.station;
+        if st.gone_at.is_some() {
+            let _ = write!(
+                out,
+                "\n{}. {GONE_ICON} {} – {GONE_WORD}\n",
+                i + 1,
+                html(&st.name)
+            );
+            continue;
+        }
         let _ = write!(
             out,
             "\n{}. {} {} – {}",
@@ -308,36 +357,86 @@ fn ago(seconds: i64) -> String {
     }
 }
 
-pub fn card(
-    sub: &SubRow,
-    game: Option<&str>,
-    last: Option<(Option<&str>, i64)>,
-    waiting: i64,
-    now: i64,
-    merchant: bool,
-) -> String {
-    let st = &sub.station;
+pub struct CardInfo<'a> {
+    pub sub: &'a SubRow,
+    pub game: Option<&'a str>,
+    pub last: Option<(Option<&'a str>, i64)>,
+    pub waiting: i64,
+    pub hardware: Option<&'a Hardware>,
+    pub now: i64,
+    pub merchant: bool,
+}
+
+fn size(bytes: u64) -> String {
+    let gib = bytes as f64 / 1_073_741_824.0;
+    if gib >= 1.0 {
+        format!("{} ГБ", gib.round())
+    } else {
+        format!("{} МБ", (bytes as f64 / 1_048_576.0).round())
+    }
+}
+
+fn hardware_lines(hw: &Hardware, merchant: bool) -> String {
+    let mut out = String::new();
+    if let Some(cpu) = &hw.cpu {
+        let _ = write!(out, "\nПроцессор: {}", html(cpu));
+    }
+    if !hw.gpus.is_empty() {
+        let gpus: Vec<String> = hw
+            .gpus
+            .iter()
+            .map(|(name, ram)| match ram {
+                Some(r) => format!("{} ({})", html(name), size(*r)),
+                None => html(name),
+            })
+            .collect();
+        let label = if gpus.len() > 1 {
+            "Видеокарты"
+        } else {
+            "Видеокарта"
+        };
+        let _ = write!(out, "\n{label}: {}", gpus.join(", "));
+    }
+    if let Some(ram) = hw.ram_bytes {
+        let _ = write!(out, "\nОЗУ: {}", size(ram));
+    }
+    if merchant && let Some(bios) = &hw.bios {
+        let _ = write!(out, "\nBIOS: {}", html(bios));
+    }
+    out
+}
+
+pub fn card(c: &CardInfo<'_>) -> String {
+    let st = &c.sub.station;
     let mut out = format!(
-        "{} <b>{}</b>\n{}\n\nСтатус: {}",
-        status_icon(st.status, st.published),
+        "{} <b>{}</b>\n{}\n\n",
+        station_icon(st),
         html(&st.name),
-        station_url(&st.uuid),
-        status_word(st.status)
+        station_url(&st.uuid)
     );
-    if st.status == Status::Ready && !st.published {
-        out.push_str(" (скрыт для пользователей)");
-    }
-    let _ = write!(out, ", уже {}", format_duration(now - st.status_since));
-    if st.status != Status::Ready {
-        let _ = write!(out, "\n{}", waiting_line(waiting));
-    }
-    if let Some(g) = game_line(st.status, game) {
-        let _ = write!(out, "\n{g}");
-    }
-    if st.status != Status::Busy
-        && let Some((_, len)) = last
-    {
-        let _ = write!(out, "\nПоследняя сессия длилась {}", format_duration(len));
+    if st.gone_at.is_some() {
+        let _ = write!(out, "Статус: {GONE_WORD}");
+        if let Some(since) = st.missing_since {
+            let _ = write!(out, ", не отвечает уже {}", format_duration(c.now - since));
+        }
+        let _ = write!(out, "\n{}", gone_note(st, c.now));
+    } else {
+        let _ = write!(out, "Статус: {}", status_word(st.status));
+        if st.status == Status::Ready && !st.published {
+            out.push_str(" (скрыт для пользователей)");
+        }
+        let _ = write!(out, ", уже {}", format_duration(c.now - st.status_since));
+        if st.status != Status::Ready {
+            let _ = write!(out, "\n{}", waiting_line(c.waiting));
+        }
+        if let Some(g) = game_line(st.status, c.game) {
+            let _ = write!(out, "\n{g}");
+        }
+        if st.status != Status::Busy
+            && let Some((_, len)) = c.last
+        {
+            let _ = write!(out, "\nПоследняя сессия длилась {}", format_duration(len));
+        }
     }
     if let Some(city) = &st.city {
         let _ = write!(out, "\n📍 {}", html(city));
@@ -345,15 +444,36 @@ pub fn card(
     if let Some(n) = st.games_count {
         let _ = write!(out, "\n🕹 Игр на станции: {n}");
     }
-    if let Some(c) = &sub.comment {
-        let _ = write!(out, "\n💬 {}", html(c));
+    if let Some(comment) = &c.sub.comment {
+        let _ = write!(out, "\n💬 {}", html(comment));
     }
-    if merchant {
+    if let Some(hw) = c.hardware {
+        let lines = hardware_lines(hw, c.merchant);
+        if !lines.is_empty() {
+            let _ = write!(out, "\n\n<b>Железо</b>{lines}");
+        }
+    }
+    if st.gone_at.is_none()
+        && let Some((text, cut)) = st
+            .description
+            .as_deref()
+            .and_then(|d| crate::description::render(d, DESCRIPTION_MAX))
+    {
+        let _ = write!(out, "\n\n<b>Описание</b>\n{text}");
+        if cut {
+            let _ = write!(
+                out,
+                "…\n<a href=\"{}\">Продолжение на странице станции на drova.io</a>",
+                station_url(&st.uuid)
+            );
+        }
+    }
+    if c.merchant {
         let _ = write!(
             out,
             "\n\nУведомления мерчанта:\nНачало сессии: {}\nУход в офлайн: {}",
-            on_off(sub.notify_busy),
-            on_off(sub.notify_offline)
+            on_off(c.sub.notify_busy),
+            on_off(c.sub.notify_offline)
         );
     }
     out
@@ -595,6 +715,52 @@ pub fn mark_taken(original: &str, suffix: &str) -> String {
     let mut text = original.replacen("🟢", "🔴", 1).replacen("🔒", "🔴", 1);
     text.push_str(suffix);
     text
+}
+
+fn comment_line(comment: Option<&str>) -> String {
+    comment.map_or_else(String::new, |c| format!("\n💬 {}", html(c)))
+}
+
+pub fn station_gone(name: &str, uuid: &str, missing_for: i64, comment: Option<&str>) -> String {
+    format!(
+        "{GONE_ICON} Станция <b>{}</b> не найдена на Drova уже {}. Похоже, её удалили.\n{}{}\n\n\
+         Удалить её из ваших подписок? Если оставить, она будет в списке с пометкой «удалена». \
+         Если станция не вернётся, подписка удалится автоматически через {GONE_KEEP_DAYS} дней.",
+        html(name),
+        format_duration(missing_for),
+        station_url(uuid),
+        comment_line(comment)
+    )
+}
+
+pub fn station_returned(name: &str, uuid: &str, comment: Option<&str>) -> String {
+    format!(
+        "✅ Станция <b>{}</b> снова есть на Drova, подписка работает как раньше.\n{}{}",
+        html(name),
+        station_url(uuid),
+        comment_line(comment)
+    )
+}
+
+pub fn gone_unsubscribed(name: &str, uuid: &str, comment: Option<&str>) -> String {
+    format!(
+        "Станции <b>{}</b> нет на Drova больше {GONE_KEEP_DAYS} дней, подписка на неё удалена.\n{}{}",
+        html(name),
+        station_url(uuid),
+        comment_line(comment)
+    )
+}
+
+pub fn gone_removed(name: &str) -> String {
+    format!("🗑 Подписка на <b>{}</b> удалена.", html(name))
+}
+
+pub fn gone_kept(name: &str) -> String {
+    format!(
+        "Хорошо, <b>{}</b> останется в списке с пометкой «удалена». Если станция вернётся, я сообщу. \
+         Если нет, подписка удалится автоматически через {GONE_KEEP_DAYS} дней.",
+        html(name)
+    )
 }
 
 pub fn session_started(

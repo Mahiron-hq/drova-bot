@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod db;
+mod description;
 mod drova;
 mod handlers;
 mod history;

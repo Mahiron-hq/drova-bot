@@ -8,6 +8,7 @@ use crate::util::is_uuid;
 
 const API_BASE: &str = "https://services.drova.io";
 const MAX_BODY: usize = 2 * 1024 * 1024;
+const MAX_DESCRIPTION: usize = 20_000;
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 pub const DESKTOP_PRODUCT: &str = "9fd0eb43-b2bb-4ce3-93b8-9df63f209098";
 
@@ -59,6 +60,16 @@ pub struct Snapshot {
     pub city: Option<String>,
     pub product_id: Option<String>,
     pub games_count: Option<i64>,
+    /// Raw HTML from the merchant.
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Hardware {
+    pub cpu: Option<String>,
+    pub gpus: Vec<(String, Option<u64>)>,
+    pub ram_bytes: Option<u64>,
+    pub bios: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -82,6 +93,27 @@ struct RawStation {
     city_name: Option<String>,
     product_id: Option<String>,
     product_list: Option<Vec<serde_json::Value>>,
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawHardware {
+    ram_bytes: Option<serde_json::Value>,
+    bios: Option<RawVendorItem>,
+    processor: Option<RawVendorItem>,
+    graphic: Option<Vec<RawGpu>>,
+}
+
+#[derive(Deserialize)]
+struct RawVendorItem {
+    manufacturer: Option<String>,
+    version: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawGpu {
+    name: Option<String>,
+    ram_bytes: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -154,6 +186,21 @@ impl DrovaClient {
             .get_json(&format!("{API_BASE}/server-manager/servers/public/{uuid}"))
             .await?;
         parse_station(raw)
+    }
+
+    /// Station hardware; `None` when Drova has no data for the station.
+    pub async fn hardware(&self, uuid: &str) -> Result<Option<Hardware>, DrovaError> {
+        if !is_uuid(uuid) {
+            return Ok(None);
+        }
+        match self
+            .get_json::<RawHardware>(&format!("{API_BASE}/server-manager/hardware/list/{uuid}"))
+            .await
+        {
+            Ok(raw) => Ok(parse_hardware(raw)),
+            Err(DrovaError::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Game title by product id; `None` when Drova does not know the product.
@@ -235,7 +282,44 @@ fn parse_station(raw: RawStation) -> Result<Snapshot, DrovaError> {
             .map(|p| p.to_ascii_lowercase())
             .filter(|p| is_uuid(p)),
         games_count: raw.product_list.map(|l| l.len() as i64),
+        description: raw
+            .description
+            .filter(|d| !d.trim().is_empty())
+            .map(|d| d.chars().take(MAX_DESCRIPTION).collect()),
     })
+}
+
+fn clean(s: Option<String>) -> Option<String> {
+    let s = s?.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!s.is_empty()).then_some(s)
+}
+
+fn bytes(v: Option<&serde_json::Value>) -> Option<u64> {
+    let v = v?;
+    v.as_u64()
+        .or_else(|| v.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
+        .filter(|b| *b > 0)
+}
+
+fn parse_hardware(raw: RawHardware) -> Option<Hardware> {
+    let hw = Hardware {
+        cpu: raw.processor.and_then(|p| clean(p.version)),
+        gpus: raw
+            .graphic
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|g| Some((clean(g.name)?, bytes(g.ram_bytes.as_ref()))))
+            .collect(),
+        ram_bytes: bytes(raw.ram_bytes.as_ref()),
+        bios: raw.bios.and_then(|b| {
+            let parts: Vec<String> = [b.manufacturer, b.version]
+                .into_iter()
+                .filter_map(clean)
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }),
+    };
+    (hw != Hardware::default()).then_some(hw)
 }
 
 #[cfg(test)]
@@ -260,6 +344,33 @@ mod tests {
         assert!(!s.published);
         assert_eq!(s.games_count, Some(2));
         assert_eq!(s.city.as_deref(), Some("St Petersburg"));
+    }
+
+    #[test]
+    fn parses_hardware() {
+        let raw: RawHardware = serde_json::from_str(
+            r#"{"ram_bytes":68642062336,"bios":{"manufacturer":null,"version":" 1.2 "},
+            "board":{"manufacturer":null,"name":null},
+            "processor":{"manufacturer":"AMD","version":"AMD Ryzen 9 5900X 12-Core Processor   "},
+            "graphic":[{"manufacturer":"NVIDIA","ram_bytes":12878610432,"name":"NVIDIA GeForce RTX 4070 SUPER"},{"name":null}]}"#,
+        )
+        .unwrap();
+        let hw = parse_hardware(raw).unwrap();
+        assert_eq!(
+            hw.cpu.as_deref(),
+            Some("AMD Ryzen 9 5900X 12-Core Processor")
+        );
+        assert_eq!(
+            hw.gpus,
+            vec![(
+                "NVIDIA GeForce RTX 4070 SUPER".to_owned(),
+                Some(12_878_610_432)
+            )]
+        );
+        assert_eq!(hw.ram_bytes, Some(68_642_062_336));
+        assert_eq!(hw.bios.as_deref(), Some("1.2"));
+        let empty: RawHardware = serde_json::from_str(r#"{"bios":{},"graphic":[]}"#).unwrap();
+        assert!(parse_hardware(empty).is_none());
     }
 
     #[test]

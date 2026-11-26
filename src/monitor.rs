@@ -8,7 +8,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::app::App;
-use crate::db::Applied;
+use crate::db::{Applied, GONE_AFTER, StationRow};
 use crate::drova::{DrovaError, Snapshot, Status};
 use crate::keyboards as kb;
 use crate::telegram::TgError;
@@ -19,6 +19,7 @@ const FAIL_STREAK_ALERT: i64 = 3;
 const ADMIN_DIGEST_GAP: i64 = 30 * 60;
 const TAKEN_WINDOW: i64 = 5 * 60;
 const MAX_BACKOFF: u32 = 10;
+const GONE_POLL_EVERY: i64 = 3_600;
 
 pub struct Monitor {
     app: Arc<App>,
@@ -28,6 +29,7 @@ pub struct Monitor {
     pending_up: HashSet<String>,
     last_digest: Option<i64>,
     unknown_states: HashSet<String>,
+    gone_polled: HashMap<String, i64>,
     backoff: u32,
 }
 
@@ -41,6 +43,7 @@ impl Monitor {
             pending_up: HashSet::new(),
             last_digest: None,
             unknown_states: HashSet::new(),
+            gone_polled: HashMap::new(),
             backoff: 1,
         }
     }
@@ -65,7 +68,33 @@ impl Monitor {
 
     async fn cycle(&mut self) -> Result<()> {
         let started = Instant::now();
-        let stations = self.app.db.stations_to_poll().await?;
+        let all = self.app.db.stations_to_poll().await?;
+        let t0 = now();
+        let known: HashSet<&str> = all.iter().map(|(u, _)| u.as_str()).collect();
+        self.streaks.retain(|u, _| known.contains(u.as_str()));
+        self.alerted.retain(|u| known.contains(u.as_str()));
+        self.pending_down.retain(|u, _| known.contains(u.as_str()));
+        self.pending_up.retain(|u| known.contains(u.as_str()));
+        let gone: HashSet<String> = all
+            .iter()
+            .filter(|(_, g)| *g)
+            .map(|(u, _)| u.clone())
+            .collect();
+        self.gone_polled.retain(|u, _| gone.contains(u));
+        let mut stations = Vec::with_capacity(all.len());
+        for (uuid, is_gone) in all {
+            if is_gone {
+                if self
+                    .gone_polled
+                    .get(&uuid)
+                    .is_some_and(|t| t0 - t < GONE_POLL_EVERY)
+                {
+                    continue;
+                }
+                self.gone_polled.insert(uuid.clone(), t0);
+            }
+            stations.push(uuid);
+        }
         let total = stations.len();
         let mut tasks = JoinSet::new();
         let sem = Arc::new(Semaphore::new(self.app.cfg.poll_concurrency));
@@ -89,7 +118,18 @@ impl Monitor {
         }
         results.sort_by(|a, b| a.0.cmp(&b.0));
         let ok = results.iter().filter(|r| r.1.is_ok()).count();
-        let api_down = total >= 3 && ok == 0;
+        let active: Vec<&Result<Snapshot, DrovaError>> = results
+            .iter()
+            .filter(|r| !gone.contains(&r.0))
+            .map(|r| &r.1)
+            .collect();
+        let active_ok = active.iter().filter(|r| r.is_ok()).count();
+        let not_found = active
+            .iter()
+            .filter(|r| matches!(r, Err(DrovaError::NotFound)))
+            .count();
+        let api_down = active.len() >= 3 && active_ok == 0;
+        let mass_missing = active.len() >= 3 && not_found * 3 > active.len();
         let was_down = self.app.health.api_down.load(Ordering::Relaxed);
         if api_down && !was_down {
             let err = results
@@ -118,10 +158,23 @@ impl Monitor {
                 }
                 Err(e) => {
                     let text = e.to_string();
+                    if gone.contains(&uuid) {
+                        tracing::debug!(uuid, error = %text, "deleted station still missing");
+                        continue;
+                    }
                     tracing::warn!(uuid, error = %text, "poll failed");
                     self.app.db.record_poll_error(&uuid, &text, now()).await?;
                     if !api_down {
                         self.on_failure(&uuid, &text);
+                    }
+                    if matches!(e, DrovaError::NotFound)
+                        && let Err(e) = self.on_not_found(&uuid, mass_missing).await
+                    {
+                        tracing::error!(
+                            uuid,
+                            error = format!("{e:#}"),
+                            "cannot handle missing station"
+                        );
                     }
                 }
             }
@@ -149,6 +202,36 @@ impl Monitor {
             self.pending_down.insert(uuid.to_owned(), error.to_owned());
             self.pending_up.remove(uuid);
         }
+    }
+
+    async fn on_not_found(&mut self, uuid: &str, mass: bool) -> Result<()> {
+        let t = now();
+        let Some(since) = self.app.db.mark_missing(uuid, t).await? else {
+            return Ok(());
+        };
+        if mass || t - since < GONE_AFTER || !self.app.db.mark_gone(uuid, t).await? {
+            return Ok(());
+        }
+        self.streaks.remove(uuid);
+        self.alerted.remove(uuid);
+        self.pending_down.remove(uuid);
+        self.pending_up.remove(uuid);
+        self.gone_polled.insert(uuid.to_owned(), t);
+        let Some(st) = self.app.db.station(uuid).await? else {
+            return Ok(());
+        };
+        tracing::info!(uuid, "station looks deleted");
+        for (sub, user) in self.app.db.subs_for_station(uuid).await? {
+            if user.blocked_at.is_some() {
+                continue;
+            }
+            let text = texts::station_gone(&st.name, uuid, t - since, sub.comment.as_deref());
+            self.app
+                .enqueue("gone", user.id, Some(uuid), &text, Some(&kb::gone(sub.id)))
+                .await?;
+        }
+        self.app.wake_queue();
+        Ok(())
     }
 
     fn on_success(&mut self, uuid: &str) {
@@ -219,6 +302,11 @@ impl Monitor {
         }
         let t = now();
         let applied = self.app.db.apply_snapshot(snap, t).await?;
+        if applied.returned {
+            tracing::info!(uuid = %snap.uuid, "deleted station is back");
+            self.gone_polled.remove(&snap.uuid);
+            notify_returned(&self.app, &applied.new).await?;
+        }
         match applied.new.status {
             Status::Busy | Status::Offline => self.on_taken(&applied, t).await,
             Status::Ready => self.on_ready(&applied).await,
@@ -363,4 +451,24 @@ impl Monitor {
         self.app.wake_queue();
         Ok(())
     }
+}
+
+/// Tells subscribers that a station marked as deleted is on Drova again.
+pub async fn notify_returned(app: &App, st: &StationRow) -> Result<()> {
+    for (sub, user) in app.db.subs_for_station(&st.uuid).await? {
+        if user.blocked_at.is_some() {
+            continue;
+        }
+        let text = texts::station_returned(&st.name, &st.uuid, sub.comment.as_deref());
+        app.enqueue(
+            "returned",
+            user.id,
+            Some(&st.uuid),
+            &text,
+            Some(&kb::open_station(&st.uuid)),
+        )
+        .await?;
+    }
+    app.wake_queue();
+    Ok(())
 }

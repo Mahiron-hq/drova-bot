@@ -5,6 +5,7 @@ use anyhow::Result;
 use tokio::sync::watch;
 
 use crate::app::App;
+use crate::db::GONE_KEEP_DAYS;
 use crate::keyboards as kb;
 use crate::texts;
 use crate::util::now;
@@ -37,6 +38,9 @@ pub async fn run(app: Arc<App>, mut shutdown: watch::Receiver<bool>) {
         }
         if let Err(e) = expired_mutes(&app).await {
             tracing::error!(error = format!("{e:#}"), "expired silence job failed");
+        }
+        if let Err(e) = expired_gone(&app).await {
+            tracing::error!(error = format!("{e:#}"), "deleted stations job failed");
         }
         if let Err(e) = weekly(&app).await {
             tracing::error!(error = format!("{e:#}"), "weekly reminder job failed");
@@ -79,6 +83,36 @@ async fn expired_mutes(app: &App) -> Result<()> {
             Some(&kb::status()),
         )
         .await?;
+    }
+    app.wake_queue();
+    Ok(())
+}
+
+async fn expired_gone(app: &App) -> Result<()> {
+    let subs = app
+        .db
+        .take_expired_gone(now() - GONE_KEEP_DAYS * 86_400)
+        .await?;
+    if subs.is_empty() {
+        return Ok(());
+    }
+    tracing::info!(
+        count = subs.len(),
+        "subscriptions to deleted stations removed"
+    );
+    for s in subs {
+        if app
+            .db
+            .user(s.user_id)
+            .await?
+            .is_none_or(|u| u.blocked_at.is_some())
+        {
+            continue;
+        }
+        let st = &s.station;
+        let text = texts::gone_unsubscribed(&st.name, &st.uuid, s.comment.as_deref());
+        app.enqueue("gone_unsub", s.user_id, Some(&st.uuid), &text, None)
+            .await?;
     }
     app.wake_queue();
     Ok(())

@@ -353,7 +353,7 @@ async fn list_view(app: &App, u: &UserRow) -> Result<Option<(String, Inline)>> {
             waiting: waiting.get(&s.station.uuid).copied().unwrap_or(0),
         })
         .collect();
-    let text = texts::list(&views, app.limit_for(u), u.mute_active(now()));
+    let text = texts::list(&views, app.limit_for(u), u.mute_active(now()), now());
     Ok(Some((text, kb::list(&subs))))
 }
 
@@ -390,14 +390,20 @@ async fn card_view(app: &App, u: &UserRow, id: i64) -> Result<Option<(String, In
         .get(&sub.station.uuid)
         .copied()
         .unwrap_or(0);
-    let text = texts::card(
-        &sub,
-        game.as_deref(),
-        last.as_ref().map(|(g, l)| (g.as_deref(), *l)),
+    let hardware = if sub.station.gone_at.is_none() {
+        app.hardware(&sub.station.uuid).await
+    } else {
+        None
+    };
+    let text = texts::card(&texts::CardInfo {
+        sub: &sub,
+        game: game.as_deref(),
+        last: last.as_ref().map(|(g, l)| (g.as_deref(), *l)),
         waiting,
-        now(),
-        u.is_merchant,
-    );
+        hardware: hardware.as_ref(),
+        now: now(),
+        merchant: u.is_merchant,
+    });
     Ok(Some((text, kb::card(&sub, u.is_merchant))))
 }
 
@@ -630,11 +636,13 @@ async fn fresh_station(app: &App, uuid: &str) -> Option<StationRow> {
             if let Some(p) = &snap.product_id {
                 app.title(p).await;
             }
-            app.db
-                .apply_snapshot(&snap, now())
-                .await
-                .ok()
-                .map(|a| a.new)
+            let a = app.db.apply_snapshot(&snap, now()).await.ok()?;
+            if a.returned
+                && let Err(e) = crate::monitor::notify_returned(app, &a.new).await
+            {
+                tracing::error!(uuid, error = format!("{e:#}"), "cannot queue return notice");
+            }
+            Some(a.new)
         }
         Err(e) => {
             tracing::info!(uuid, error = %e, "station lookup failed");
@@ -970,6 +978,8 @@ enum Cb {
     DeleteAsk(i64),
     DeleteYes(i64),
     Share(i64),
+    GoneRemove(i64),
+    GoneKeep(i64),
     Flag(i64, bool),
     StatusRefresh,
     NotifyRefresh(String),
@@ -1003,6 +1013,8 @@ fn parse_cb(data: &str) -> Option<Cb> {
         ["dq", _] => Cb::DeleteAsk(id(1)?),
         ["dy", _] => Cb::DeleteYes(id(1)?),
         ["sh", _] => Cb::Share(id(1)?),
+        ["gd", _] => Cb::GoneRemove(id(1)?),
+        ["gk", _] => Cb::GoneKeep(id(1)?),
         ["mf", "b", _] => Cb::Flag(id(2)?, true),
         ["mf", "o", _] => Cb::Flag(id(2)?, false),
         ["st" | "status", "r" | "refresh"] => Cb::StatusRefresh,
@@ -1261,6 +1273,20 @@ async fn callback_inner(
             }
             None => alert(texts::SUB_NOT_FOUND),
         },
+        Cb::GoneRemove(id) | Cb::GoneKeep(id) => {
+            let Some(sub) = app.db.sub(u.id, id).await? else {
+                edit(app, chat, mid, texts::SUB_NOT_FOUND, None).await;
+                return Ok(None);
+            };
+            let text = if matches!(cb, Cb::GoneRemove(_)) {
+                app.db.remove_sub(u.id, id).await?;
+                texts::gone_removed(&sub.station.name)
+            } else {
+                texts::gone_kept(&sub.station.name)
+            };
+            edit(app, chat, mid, &text, None).await;
+            None
+        }
         Cb::Flag(id, busy) => {
             if !u.is_merchant {
                 return Ok(alert("Эти уведомления доступны только мерчантам (/role)."));

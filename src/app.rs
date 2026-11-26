@@ -7,13 +7,17 @@ use tokio::sync::{Mutex, Notify};
 
 use crate::config::Config;
 use crate::db::{Db, SubRow, UserRow};
-use crate::drova::{DESKTOP_PRODUCT, DESKTOP_TITLE, DrovaClient};
+use crate::drova::{DESKTOP_PRODUCT, DESKTOP_TITLE, DrovaClient, Hardware};
 use crate::telegram::Telegram;
 use crate::texts::{self, SubView};
 use crate::util::now;
 
 const PRODUCT_TTL: i64 = 30 * 86_400;
 const DIALOG_TTL: i64 = 15 * 60;
+const HARDWARE_TTL: i64 = 6 * 3_600;
+const HARDWARE_RETRY: i64 = 5 * 60;
+const HARDWARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const HARDWARE_CACHE_MAX: usize = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommentOrigin {
@@ -57,6 +61,7 @@ pub struct App {
     cooldowns: Mutex<HashMap<(i64, String), i64>>,
     flood: Mutex<HashMap<i64, (i64, u32)>>,
     user_locks: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
+    hardware: Mutex<HashMap<String, (Option<Hardware>, i64)>>,
 }
 
 impl App {
@@ -81,6 +86,7 @@ impl App {
             cooldowns: Mutex::new(HashMap::new()),
             flood: Mutex::new(HashMap::new()),
             user_locks: Mutex::new(HashMap::new()),
+            hardware: Mutex::new(HashMap::new()),
         }
     }
 
@@ -190,6 +196,31 @@ impl App {
                 cached.map(|c| c.0)
             }
         }
+    }
+
+    /// Station hardware, cached for a few hours; failed lookups are retried after a few minutes.
+    pub async fn hardware(&self, uuid: &str) -> Option<Hardware> {
+        let t = now();
+        if let Some((hw, until)) = self.hardware.lock().await.get(uuid)
+            && *until > t
+        {
+            return hw.clone();
+        }
+        let (hw, ttl) =
+            match tokio::time::timeout(HARDWARE_TIMEOUT, self.drova.hardware(uuid)).await {
+                Ok(Ok(hw)) => (hw, HARDWARE_TTL),
+                Ok(Err(e)) => {
+                    tracing::debug!(uuid, error = %e, "hardware lookup failed");
+                    (None, HARDWARE_RETRY)
+                }
+                Err(_) => (None, HARDWARE_RETRY),
+            };
+        let mut map = self.hardware.lock().await;
+        map.retain(|_, (_, until)| *until > t);
+        if map.len() < HARDWARE_CACHE_MAX {
+            map.insert(uuid.to_owned(), (hw.clone(), t + ttl));
+        }
+        hw
     }
 
     /// Cached titles only, for building views without network calls.

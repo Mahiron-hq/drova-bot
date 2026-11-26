@@ -59,7 +59,18 @@ async fn process(app: &App, last_sent: &mut HashMap<i64, Instant>) -> Result<()>
         .drop_stale(&["session_start", "offline"], 30 * 60, t)
         .await?;
     dropped += db
-        .drop_stale(&["broadcast", "weekly", "unmute_report"], 7 * 86_400, t)
+        .drop_stale(
+            &[
+                "broadcast",
+                "weekly",
+                "unmute_report",
+                "gone",
+                "returned",
+                "gone_unsub",
+            ],
+            7 * 86_400,
+            t,
+        )
         .await?;
     if dropped > 0 {
         tracing::info!(dropped, "stale queued messages dropped");

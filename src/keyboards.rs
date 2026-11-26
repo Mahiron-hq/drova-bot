@@ -86,6 +86,13 @@ pub fn notify(uuid: &str) -> Inline {
     ]]
 }
 
+pub fn gone(sub_id: i64) -> Inline {
+    vec![vec![
+        Button::cb("🗑 Удалить", format!("gd:{sub_id}")),
+        Button::cb("Оставить", format!("gk:{sub_id}")),
+    ]]
+}
+
 pub fn open_station(uuid: &str) -> Inline {
     vec![vec![Button::url(
         "🌐 Открыть на drova.io",

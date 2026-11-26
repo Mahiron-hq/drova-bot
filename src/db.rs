@@ -11,12 +11,19 @@ use sqlx::{AssertSqlSafe, Row, SqlitePool};
 
 use crate::drova::{Snapshot, Status};
 
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_station_extras.sql"),
+];
 
 pub const TRANSITIONS_KEEP_DAYS: i64 = 90;
 pub const QUEUE_KEEP_DAYS: i64 = 30;
 pub const BLOCKED_KEEP_DAYS: i64 = 90;
 const POLL_ERRORS_KEEP: i64 = 1000;
+/// A station that answers 404 this long is treated as deleted.
+pub const GONE_AFTER: i64 = 3_600;
+/// Subscriptions to a deleted station are removed after this many days.
+pub const GONE_KEEP_DAYS: i64 = 30;
 
 #[derive(Clone)]
 pub struct Db {
@@ -57,6 +64,9 @@ pub struct StationRow {
     pub games_count: Option<i64>,
     pub status_since: i64,
     pub checked_at: Option<i64>,
+    pub description: Option<String>,
+    pub missing_since: Option<i64>,
+    pub gone_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +120,7 @@ pub enum UserFlag {
 
 /// Outcome of storing a fresh station snapshot.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Applied {
     pub old: Option<StationRow>,
     pub new: StationRow,
@@ -118,6 +129,8 @@ pub struct Applied {
     pub game_changed_while_busy: bool,
     /// Drova reported BUSY after another state or with a new game; HANDSHAKE alone does not count.
     pub session_started: bool,
+    /// The station was marked as deleted and is back.
+    pub returned: bool,
 }
 
 #[derive(Debug, Default)]
@@ -176,13 +189,17 @@ fn station_row(r: &SqliteRow, prefix: &str) -> Result<StationRow> {
         games_count: r.try_get(c("games_count").as_str())?,
         status_since: r.try_get(c("status_since").as_str())?,
         checked_at: r.try_get(c("checked_at").as_str())?,
+        description: r.try_get(c("description").as_str())?,
+        missing_since: r.try_get(c("missing_since").as_str())?,
+        gone_at: r.try_get(c("gone_at").as_str())?,
     })
 }
 
 const SUB_SELECT: &str = "SELECT s.id, s.user_id, s.last_status, s.pending, s.notify_busy, s.notify_offline, s.comment,
     st.uuid AS st_uuid, st.name AS st_name, st.status AS st_status,
     st.published AS st_published, st.city AS st_city, st.product_id AS st_product_id,
-    st.games_count AS st_games_count, st.status_since AS st_status_since, st.checked_at AS st_checked_at
+    st.games_count AS st_games_count, st.status_since AS st_status_since, st.checked_at AS st_checked_at,
+    st.description AS st_description, st.missing_since AS st_missing_since, st.gone_at AS st_gone_at
     FROM subscriptions AS s JOIN stations AS st ON st.uuid = s.station";
 
 fn sub_row(r: &SqliteRow) -> Result<SubRow> {
@@ -386,15 +403,57 @@ impl Db {
         row.as_ref().map(|r| station_row(r, "")).transpose()
     }
 
-    /// Stations that have at least one subscriber who did not block the bot.
-    pub async fn stations_to_poll(&self) -> Result<Vec<String>> {
-        Ok(sqlx::query_scalar(
-            "SELECT DISTINCT s.station FROM subscriptions AS s
+    /// Stations that have at least one subscriber who did not block the bot,
+    /// with a flag for stations marked as deleted.
+    pub async fn stations_to_poll(&self) -> Result<Vec<(String, bool)>> {
+        Ok(sqlx::query_as(
+            "SELECT DISTINCT s.station, st.gone_at IS NOT NULL FROM subscriptions AS s
              JOIN users AS u ON u.id = s.user_id
+             JOIN stations AS st ON st.uuid = s.station
              WHERE u.blocked_at IS NULL ORDER BY s.station",
         )
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    /// Remembers the first 404 of a streak and returns its time.
+    pub async fn mark_missing(&self, uuid: &str, now: i64) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar(
+            "UPDATE stations SET missing_since = COALESCE(missing_since, ?) WHERE uuid = ? RETURNING missing_since",
+        )
+        .bind(now)
+        .bind(uuid)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten())
+    }
+
+    /// Marks the station as deleted; false when it already was.
+    pub async fn mark_gone(&self, uuid: &str, now: i64) -> Result<bool> {
+        let r = sqlx::query("UPDATE stations SET gone_at = ? WHERE uuid = ? AND gone_at IS NULL")
+            .bind(now)
+            .bind(uuid)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Removes subscriptions to stations deleted before `cutoff` and returns them.
+    pub async fn take_expired_gone(&self, cutoff: i64) -> Result<Vec<SubRow>> {
+        let rows = sqlx::query(AssertSqlSafe(format!(
+            "{SUB_SELECT} WHERE st.gone_at IS NOT NULL AND st.gone_at < ? ORDER BY s.id"
+        )))
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        let subs: Vec<SubRow> = rows.iter().map(sub_row).collect::<Result<_>>()?;
+        for s in &subs {
+            sqlx::query("DELETE FROM subscriptions WHERE id = ?")
+                .bind(s.id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(subs)
     }
 
     pub async fn apply_snapshot(&self, snap: &Snapshot, now: i64) -> Result<Applied> {
@@ -425,13 +484,15 @@ impl Db {
             _ => now,
         };
         sqlx::query(
-            "INSERT INTO stations (uuid, name, status, raw_state, published, city, product_id, games_count, status_since, checked_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO stations (uuid, name, status, raw_state, published, city, product_id, games_count,
+                status_since, checked_at, description)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(uuid) DO UPDATE SET name = excluded.name, status = excluded.status,
                 raw_state = excluded.raw_state, published = excluded.published, city = excluded.city,
                 product_id = COALESCE(excluded.product_id, stations.product_id),
                 games_count = excluded.games_count, status_since = excluded.status_since,
-                checked_at = excluded.checked_at",
+                checked_at = excluded.checked_at, description = excluded.description,
+                missing_since = NULL, gone_at = NULL",
         )
         .bind(&snap.uuid)
         .bind(&snap.name)
@@ -443,6 +504,7 @@ impl Db {
         .bind(snap.games_count)
         .bind(status_since)
         .bind(now)
+        .bind(&snap.description)
         .execute(&mut *tx)
         .await?;
         if status_changed || game_changed_while_busy {
@@ -464,11 +526,12 @@ impl Db {
             .map(|r| station_row(&r, ""))??;
         tx.commit().await?;
         Ok(Applied {
-            old,
             new,
             status_changed,
             game_changed_while_busy,
             session_started,
+            returned: old.as_ref().is_some_and(|o| o.gone_at.is_some()),
+            old,
         })
     }
 
@@ -1187,6 +1250,7 @@ mod tests {
             city: None,
             product_id: product.map(Into::into),
             games_count: Some(3),
+            description: Some("<p>hi</p>".into()),
         }
     }
 
@@ -1243,6 +1307,42 @@ mod tests {
         assert!(!a.session_started);
         let a = apply(snap_raw(Status::Busy, Some("g3"), "BUSY"), 70).await;
         assert!(a.game_changed_while_busy && a.session_started);
+    }
+
+    #[tokio::test]
+    async fn gone_station_lifecycle() {
+        let db = memory().await;
+        let uuid = "05225c83-dd3b-4c12-832b-48227262f960";
+        db.touch_user(1, 0).await.unwrap();
+        db.apply_snapshot(&snap(Status::Ready, None), 0)
+            .await
+            .unwrap();
+        db.add_subscription(1, uuid, Status::Ready, false, 5, 0)
+            .await
+            .unwrap();
+        assert_eq!(db.mark_missing(uuid, 100).await.unwrap(), Some(100));
+        assert_eq!(db.mark_missing(uuid, 200).await.unwrap(), Some(100));
+        assert!(db.mark_gone(uuid, 4_000).await.unwrap());
+        assert!(!db.mark_gone(uuid, 4_100).await.unwrap());
+        assert_eq!(
+            db.stations_to_poll().await.unwrap(),
+            vec![(uuid.to_owned(), true)]
+        );
+        let sub = &db.subs_for_user(1).await.unwrap()[0];
+        assert_eq!(sub.station.gone_at, Some(4_000));
+        assert_eq!(sub.station.description.as_deref(), Some("<p>hi</p>"));
+        let a = db
+            .apply_snapshot(&snap(Status::Ready, None), 5_000)
+            .await
+            .unwrap();
+        assert!(a.returned && a.new.gone_at.is_none() && a.new.missing_since.is_none());
+        db.mark_missing(uuid, 6_000).await.unwrap();
+        db.mark_gone(uuid, 7_000).await.unwrap();
+        assert!(db.take_expired_gone(7_000).await.unwrap().is_empty());
+        let removed = db.take_expired_gone(7_001).await.unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(db.subs_for_user(1).await.unwrap().is_empty());
+        assert_eq!(db.stations_to_poll().await.unwrap(), Vec::new());
     }
 
     #[tokio::test]
