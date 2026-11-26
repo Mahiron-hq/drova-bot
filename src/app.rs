@@ -18,6 +18,7 @@ const HARDWARE_TTL: i64 = 6 * 3_600;
 const HARDWARE_RETRY: i64 = 5 * 60;
 const HARDWARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const HARDWARE_CACHE_MAX: usize = 2_000;
+const TITLE_UNKNOWN_RETRY: i64 = 6 * 3_600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommentOrigin {
@@ -62,6 +63,8 @@ pub struct App {
     flood: Mutex<HashMap<i64, (i64, u32)>>,
     user_locks: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
     hardware: Mutex<HashMap<String, (Option<Hardware>, i64)>>,
+    /// Product ids whose title lookup failed, with the time of the next try.
+    title_misses: Mutex<HashMap<String, i64>>,
 }
 
 impl App {
@@ -87,6 +90,7 @@ impl App {
             flood: Mutex::new(HashMap::new()),
             user_locks: Mutex::new(HashMap::new()),
             hardware: Mutex::new(HashMap::new()),
+            title_misses: Mutex::new(HashMap::new()),
         }
     }
 
@@ -183,19 +187,42 @@ impl App {
         {
             return Some(title.clone());
         }
-        match self.drova.product_title(product_id).await {
-            Ok(Some(title)) => {
-                if let Err(e) = self.db.save_product(product_id, &title, now()).await {
+        let t = now();
+        if self
+            .title_misses
+            .lock()
+            .await
+            .get(product_id)
+            .is_some_and(|next| *next > t)
+        {
+            return cached.map(|c| c.0);
+        }
+        let retry_in = match tokio::time::timeout(
+            HARDWARE_TIMEOUT,
+            self.drova.product_title(product_id),
+        )
+        .await
+        {
+            Ok(Ok(Some(title))) => {
+                if let Err(e) = self.db.save_product(product_id, &title, t).await {
                     tracing::warn!(error = %e, "cannot save product title");
                 }
-                Some(title)
+                self.title_misses.lock().await.remove(product_id);
+                return Some(title);
             }
-            Ok(None) => cached.map(|c| c.0),
-            Err(e) => {
+            Ok(Ok(None)) => TITLE_UNKNOWN_RETRY,
+            Ok(Err(e)) => {
                 tracing::debug!(product_id, error = %e, "product title lookup failed");
-                cached.map(|c| c.0)
+                HARDWARE_RETRY
             }
+            Err(_) => HARDWARE_RETRY,
+        };
+        let mut misses = self.title_misses.lock().await;
+        misses.retain(|_, next| *next > t);
+        if misses.len() < HARDWARE_CACHE_MAX {
+            misses.insert(product_id.to_owned(), t + retry_in);
         }
+        cached.map(|c| c.0)
     }
 
     /// Station hardware, cached for a few hours; failed lookups are retried after a few minutes.
@@ -281,21 +308,6 @@ impl App {
             })
             .collect();
         Ok(Some(texts::status(&views, now())))
-    }
-
-    pub async fn enqueue(
-        &self,
-        kind: &str,
-        chat_id: i64,
-        station: Option<&str>,
-        text: &str,
-        keyboard: Option<&crate::telegram::Inline>,
-    ) -> Result<()> {
-        let kb = keyboard.map(serde_json::to_string).transpose()?;
-        self.db
-            .enqueue(kind, chat_id, station, text, kb.as_deref(), now())
-            .await?;
-        Ok(())
     }
 
     pub fn wake_queue(&self) {

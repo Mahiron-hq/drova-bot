@@ -150,7 +150,7 @@ async fn dispatch(args: &[String]) -> Result<()> {
             Ok(())
         }
         ["check-token"] => {
-            load_env();
+            load_env()?;
             let cfg = Config::from_env()?;
             let tg = Telegram::new(&cfg.bot_token, None)?;
             let me = tg.get_me().await.map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -165,11 +165,16 @@ async fn dispatch(args: &[String]) -> Result<()> {
     }
 }
 
-fn load_env() {
-    if let Err(e) = dotenvy::dotenv()
-        && !e.not_found()
-    {
-        let _ = writeln!(std::io::stderr(), "warning: cannot read .env: {e}");
+/// Loads `.env`; a broken file stops the start, and its lines are not printed as they may hold the token.
+fn load_env() -> Result<()> {
+    match dotenvy::dotenv() {
+        Ok(_) => Ok(()),
+        Err(e) if e.not_found() => Ok(()),
+        Err(dotenvy::Error::LineParse(_, index)) => {
+            bail!("cannot parse .env near character {index}")
+        }
+        Err(dotenvy::Error::Io(e)) => bail!("cannot read .env: {e}"),
+        Err(_) => bail!("cannot read .env"),
     }
 }
 
@@ -272,7 +277,7 @@ fn spawn_watchdog(app: Arc<App>, mut shutdown: watch::Receiver<bool>) {
 }
 
 async fn run() -> Result<()> {
-    load_env();
+    load_env()?;
     let cfg = Config::from_env()?;
     init_logging(cfg.log_level);
     tracing::info!(version = texts::VERSION, config = ?cfg, "starting");
@@ -307,10 +312,18 @@ async fn run() -> Result<()> {
     let mut handlers = JoinSet::new();
     let mut offset = 0_i64;
     let mut delay = 1;
+    let mut worker_died = false;
     loop {
         let updates = tokio::select! {
             r = app.tg.get_updates(offset, 50) => r,
             _ = shutdown.changed() => break,
+            Some(done) = workers.join_next() => {
+                if !*shutdown.borrow() {
+                    tracing::error!(result = ?done, "background worker stopped, restarting the bot");
+                    worker_died = true;
+                }
+                break;
+            }
         };
         app.health.last_updates.store(now(), Ordering::Relaxed);
         match updates {
@@ -341,7 +354,7 @@ async fn run() -> Result<()> {
     tracing::info!("stopping");
     let _ = tx.send(true);
     if offset > 0 {
-        let _ = app.tg.get_updates(offset, 0).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), app.tg.get_updates(offset, 0)).await;
     }
     let _ = tokio::time::timeout(Duration::from_secs(15), async {
         while handlers.join_next().await.is_some() {}
@@ -353,5 +366,8 @@ async fn run() -> Result<()> {
     .await;
     app.db.close().await;
     tracing::info!("stopped");
+    if worker_died {
+        bail!("a background worker stopped unexpectedly");
+    }
     Ok(())
 }

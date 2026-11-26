@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::app::{App, CommentOrigin, Dialog};
-use crate::db::{AddResult, StationRow, SubFlag, UserFlag, UserRow};
+use crate::db::{AddResult, Outgoing, StationRow, SubFlag, UserFlag, UserRow};
 use crate::drova::Status;
 use crate::history;
 use crate::keyboards as kb;
@@ -16,6 +16,8 @@ use crate::util::{clip, extract_station_ids, first_station_id, html, is_uuid, no
 const REFRESH_COOLDOWN: i64 = 5;
 const SUBSCRIBE_COOLDOWN: i64 = 30;
 const FRESH_SNAPSHOT: i64 = 60;
+/// Destructive confirmation buttons stop working after this many seconds.
+const CONFIRM_TTL: i64 = 600;
 
 pub async fn handle(app: Arc<App>, upd: Update) {
     let user_id = upd
@@ -151,12 +153,14 @@ async fn message_inner(app: &App, u: &UserRow, chat: i64, m: &Message) -> Result
     if let Some(d) = app.dialog(u.id).await {
         return dialog_input(app, u, chat, d, text).await;
     }
-    match first_station_id(text) {
-        Some(uuid) => subscribe(app, u, chat, &uuid).await,
-        None => {
+    let mut ids = extract_station_ids(text);
+    match ids.len() {
+        0 => {
             send(app, chat, texts::SEND_LINK, Some(&kb::main())).await;
             Ok(())
         }
+        1 => subscribe(app, u, chat, &ids.remove(0)).await,
+        _ => import_items(app, u, chat, ids.into_iter().map(|id| (id, None)).collect()).await,
     }
 }
 
@@ -262,16 +266,6 @@ async fn command(app: &App, u: &UserRow, chat: i64, cmd: &str, arg: &str) -> Res
         "import_subs" | "import" => {
             let count = app.db.sub_count(u.id).await?;
             let limit = app.limit_for(u);
-            if count >= limit {
-                send(
-                    app,
-                    chat,
-                    &format!("Лимит подписок ({limit}) исчерпан. Удалите лишние через /list, затем повторите импорт."),
-                    None,
-                )
-                .await;
-                return Ok(());
-            }
             app.set_dialog(u.id, Dialog::Import).await;
             send(app, chat, &texts::import_ask(count, limit), None).await;
             Ok(())
@@ -353,7 +347,13 @@ async fn list_view(app: &App, u: &UserRow) -> Result<Option<(String, Inline)>> {
             waiting: waiting.get(&s.station.uuid).copied().unwrap_or(0),
         })
         .collect();
-    let text = texts::list(&views, app.limit_for(u), u.mute_active(now()), now());
+    let text = texts::list(
+        &views,
+        app.limit_for(u),
+        u.mute_active(now()),
+        u.is_merchant,
+        now(),
+    );
     Ok(Some((text, kb::list(&subs))))
 }
 
@@ -626,21 +626,33 @@ async fn admin(app: &App, u: &UserRow, chat: i64) -> Result<()> {
 
 /// Snapshot from the monitor cache when fresh, otherwise a live request.
 async fn fresh_station(app: &App, uuid: &str) -> Option<StationRow> {
-    if let Ok(Some(st)) = app.db.station(uuid).await
+    let cached = app.db.station(uuid).await.ok().flatten();
+    if let Some(st) = &cached
         && st.checked_at.is_some_and(|c| now() - c < FRESH_SNAPSHOT)
     {
-        return Some(st);
+        return cached;
     }
     match app.drova.station(uuid).await {
         Ok(snap) => {
             if let Some(p) = &snap.product_id {
                 app.title(p).await;
             }
-            let a = app.db.apply_snapshot(&snap, now()).await.ok()?;
-            if a.returned
-                && let Err(e) = crate::monitor::notify_returned(app, &a.new).await
-            {
-                tracing::error!(uuid, error = format!("{e:#}"), "cannot queue return notice");
+            let on_return = if cached.as_ref().is_some_and(|s| s.gone_at.is_some()) {
+                crate::monitor::returned_notices(app, uuid, &snap.name)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let a = match app.db.apply_snapshot(&snap, now(), &on_return).await {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::error!(uuid, error = format!("{e:#}"), "cannot store station");
+                    return None;
+                }
+            };
+            if a.returned {
+                app.wake_queue();
             }
             Some(a.new)
         }
@@ -648,14 +660,6 @@ async fn fresh_station(app: &App, uuid: &str) -> Option<StationRow> {
             tracing::info!(uuid, error = %e, "station lookup failed");
             None
         }
-    }
-}
-
-fn pending_for(u: &UserRow, st: &StationRow) -> bool {
-    if u.is_merchant {
-        st.status != Status::Ready
-    } else {
-        !(st.status == Status::Ready && st.published)
     }
 }
 
@@ -680,7 +684,7 @@ async fn subscribe(app: &App, u: &UserRow, chat: i64, uuid: &str) -> Result<()> 
     let limit = app.limit_for(u);
     let result = app
         .db
-        .add_subscription(u.id, uuid, st.status, pending_for(u, &st), limit, now())
+        .add_subscription(u.id, uuid, u.is_merchant, limit, now())
         .await?;
     let (id, updated) = match result {
         AddResult::Limit => {
@@ -798,7 +802,7 @@ async fn import_items(
         };
         match app
             .db
-            .add_subscription(u.id, &uuid, st.status, pending_for(u, &st), limit, now())
+            .add_subscription(u.id, &uuid, u.is_merchant, limit, now())
             .await?
         {
             AddResult::Added(_) => added.push(st.name.clone()),
@@ -1203,6 +1207,9 @@ async fn callback_inner(
             })
         }
         Cb::CommentLater => {
+            if matches!(app.dialog(u.id).await, Some(Dialog::Comment { .. })) {
+                app.clear_dialog(u.id).await;
+            }
             edit(
                 app,
                 chat,
@@ -1362,6 +1369,10 @@ async fn callback_inner(
             edit(app, chat, mid, &texts::role_set(merchant), None).await;
             None
         }
+        Cb::Clear(true) | Cb::Forget(true) if now() - msg.date > CONFIRM_TTL => {
+            edit(app, chat, mid, texts::BUTTON_EXPIRED, None).await;
+            None
+        }
         Cb::Clear(yes) => {
             if yes {
                 let n = app.db.clear_subs(u.id).await?;
@@ -1433,9 +1444,11 @@ async fn callback_inner(
                 (true, Some(Dialog::BroadcastConfirm(text))) => {
                     let targets = app.db.broadcast_targets().await?;
                     let body = html(&text);
-                    for id in &targets {
-                        app.enqueue("broadcast", *id, None, &body, None).await?;
-                    }
+                    let msgs = targets
+                        .iter()
+                        .map(|id| Outgoing::new("broadcast", *id, None, body.as_str(), None))
+                        .collect::<Result<Vec<_>>>()?;
+                    app.db.enqueue_all(&msgs, now()).await?;
                     app.wake_queue();
                     edit(
                         app,

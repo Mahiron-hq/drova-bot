@@ -53,8 +53,11 @@ pub struct Telegram {
 
 impl Telegram {
     pub fn new(token: &str, allowed: Option<HashSet<i64>>) -> anyhow::Result<Self> {
+        // The token is in the URL path: never follow a redirect or send a Referer.
         let http = reqwest::Client::builder()
             .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .referer(false)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(75))
             .pool_idle_timeout(Duration::from_secs(90))
@@ -102,12 +105,10 @@ impl Telegram {
             .await
             .map_err(|e| TgError::Network(e.without_url().to_string()))?;
         let status = resp.status();
-        let body: Value = resp.json().await.map_err(|e| {
-            if status.is_server_error() {
-                TgError::Api(i64::from(status.as_u16()), "server error".to_owned())
-            } else {
-                TgError::Network(e.without_url().to_string())
-            }
+        let body: Value = resp.json().await.map_err(|e| match status.as_u16() {
+            429 => TgError::RetryAfter(5),
+            code if !status.is_success() => TgError::Api(i64::from(code), format!("HTTP {code}")),
+            _ => TgError::Network(e.without_url().to_string()),
         })?;
         if body.get("ok").and_then(Value::as_bool) == Some(true) {
             return Ok(body.get("result").cloned().unwrap_or(Value::Null));

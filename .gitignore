@@ -9,6 +9,7 @@
 *.bak-*
 .env
 .env.*
+*.env
 !deploy/*.env.example
 *.pem
 *.key

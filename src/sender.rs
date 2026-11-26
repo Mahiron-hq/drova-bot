@@ -31,15 +31,20 @@ fn retry_delay(attempts: i64) -> i64 {
 
 pub async fn run(app: Arc<App>, mut shutdown: watch::Receiver<bool>) {
     let mut last_sent: HashMap<i64, Instant> = HashMap::new();
+    let mut paused_until = 0;
     loop {
-        if let Err(e) = process(&app, &mut last_sent).await {
+        if now() >= paused_until
+            && let Err(e) = process(&app, &mut last_sent, &mut paused_until).await
+        {
             tracing::error!(error = format!("{e:#}"), "queue processing failed");
         }
         tokio::select! {
             () = app.queue_wake.notified() => {}
             () = tokio::time::sleep(Duration::from_secs(5)) => {}
             _ = shutdown.changed() => {
-                if let Err(e) = process(&app, &mut last_sent).await {
+                if now() >= paused_until
+                    && let Err(e) = process(&app, &mut last_sent, &mut paused_until).await
+                {
                     tracing::error!(error = format!("{e:#}"), "final queue flush failed");
                 }
                 return;
@@ -48,7 +53,11 @@ pub async fn run(app: Arc<App>, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
-async fn process(app: &App, last_sent: &mut HashMap<i64, Instant>) -> Result<()> {
+async fn process(
+    app: &App,
+    last_sent: &mut HashMap<i64, Instant>,
+    paused_until: &mut i64,
+) -> Result<()> {
     let t = now();
     let db = &app.db;
     let mut dropped = db.drop_stale(&["admin"], 3600, t).await?;
@@ -82,6 +91,10 @@ async fn process(app: &App, last_sent: &mut HashMap<i64, Instant>) -> Result<()>
             return Ok(());
         }
         for row in rows {
+            // The monitor may have dropped it since the batch was read.
+            if !db.is_pending(row.id).await? {
+                continue;
+            }
             let t = now();
             let user = db.user(row.chat_id).await?;
             if row.kind != "admin" {
@@ -131,7 +144,9 @@ async fn process(app: &App, last_sent: &mut HashMap<i64, Instant>) -> Result<()>
                 }
                 Err(TgError::RetryAfter(s)) => {
                     tracing::warn!(seconds = s, "flood control, queue paused");
-                    db.mark_retry(row.id, t + s as i64, "flood control").await?;
+                    *paused_until = t + s as i64;
+                    db.mark_retry(row.id, *paused_until, "flood control")
+                        .await?;
                     return Ok(());
                 }
                 Err(e) if e.is_network() => {

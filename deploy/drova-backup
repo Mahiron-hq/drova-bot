@@ -6,13 +6,25 @@ SRC=${SRC:-/var/lib/drova-bot/drova_monitor.sqlite3}
 DIR=${DIR:-/var/backups/drova-bot}
 KEEP=${KEEP:-7}
 
+# sqlite3 would create an empty database for a wrong path.
+if [ ! -s "$SRC" ]; then
+    echo "drova-backup: $SRC is missing or empty" >&2
+    exit 1
+fi
+
 install -d -m 750 "$DIR"
 OUT="$DIR/drova-$(date +%F).sqlite3"
 TMP="$OUT.tmp"
 rm -f "$TMP"
+trap 'rm -f "$TMP"' EXIT
 sqlite3 "$SRC" ".backup '$TMP'"
 sqlite3 "$TMP" 'PRAGMA journal_mode=DELETE' >/dev/null
 [ "$(sqlite3 "$TMP" 'PRAGMA integrity_check')" = ok ]
+if [ "$(sqlite3 "$TMP" 'PRAGMA user_version')" -lt 1 ] ||
+    [ "$(sqlite3 "$TMP" "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('users', 'subscriptions', 'stations')")" != 3 ]; then
+    echo "drova-backup: $SRC is not a drova-bot database" >&2
+    exit 1
+fi
 chmod 640 "$TMP"
 mv -f "$TMP" "$OUT"
 ls -1t "$DIR"/drova-*.sqlite3 | tail -n +$((KEEP + 1)) | xargs -r rm -f --

@@ -7,9 +7,10 @@ use anyhow::{Context, Result, bail};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
-use sqlx::{AssertSqlSafe, Row, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, Sqlite, SqliteConnection, SqlitePool, Transaction};
 
 use crate::drova::{Snapshot, Status};
+use crate::telegram::Inline;
 
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
@@ -98,6 +99,62 @@ pub struct QueueRow {
     pub attempts: i64,
 }
 
+/// A message to be put into the queue.
+#[derive(Debug, Clone)]
+pub struct Outgoing {
+    pub kind: &'static str,
+    pub chat_id: i64,
+    pub station: Option<String>,
+    pub text: String,
+    pub keyboard: Option<String>,
+}
+
+impl Outgoing {
+    pub fn new(
+        kind: &'static str,
+        chat_id: i64,
+        station: Option<&str>,
+        text: impl Into<String>,
+        keyboard: Option<&Inline>,
+    ) -> Result<Self> {
+        Ok(Self {
+            kind,
+            chat_id,
+            station: station.map(ToOwned::to_owned),
+            text: text.into(),
+            keyboard: keyboard.map(serde_json::to_string).transpose()?,
+        })
+    }
+}
+
+async fn insert_msgs(conn: &mut SqliteConnection, msgs: &[Outgoing], now: i64) -> Result<()> {
+    for m in msgs {
+        sqlx::query(
+            "INSERT INTO queue (kind, chat_id, station, text, keyboard, not_before, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(m.kind)
+        .bind(m.chat_id)
+        .bind(&m.station)
+        .bind(&m.text)
+        .bind(&m.keyboard)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Whether a subscriber still waits for the station to become free.
+pub fn pending_for(merchant: bool, status: Status, published: bool) -> bool {
+    if merchant {
+        status != Status::Ready
+    } else {
+        !(status == Status::Ready && published)
+    }
+}
+
 #[derive(Debug)]
 pub enum AddResult {
     Added(i64),
@@ -124,13 +181,17 @@ pub enum UserFlag {
 pub struct Applied {
     pub old: Option<StationRow>,
     pub new: StationRow,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub status_changed: bool,
     /// A new game started while the station stayed busy.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub game_changed_while_busy: bool,
     /// Drova reported BUSY after another state or with a new game; HANDSHAKE alone does not count.
     pub session_started: bool,
     /// The station was marked as deleted and is back.
     pub returned: bool,
+    /// A newer snapshot was already stored; nothing was changed.
+    pub stale: bool,
 }
 
 #[derive(Debug, Default)]
@@ -241,6 +302,11 @@ impl Db {
         self.pool.close().await;
     }
 
+    /// Transaction that takes the write lock at once, so reads inside it stay current.
+    async fn write_tx(&self) -> Result<Transaction<'static, Sqlite>> {
+        Ok(self.pool.begin_with("BEGIN IMMEDIATE").await?)
+    }
+
     // Users
 
     /// Registers activity: creates the user if needed and clears the blocked mark.
@@ -291,24 +357,39 @@ impl Db {
         Ok(())
     }
 
-    /// Ends expired silence and returns the users who should get a status report.
-    pub async fn take_expired_mutes(&self, now: i64) -> Result<Vec<i64>> {
-        let rows = sqlx::query(
-            "UPDATE users SET muted = 0, mute_until = NULL
-             WHERE muted = 1 AND mute_until IS NOT NULL AND mute_until <= ?
-             RETURNING id, blocked_at",
+    /// Users whose silence has expired.
+    pub async fn expired_mutes(&self, now: i64) -> Result<Vec<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM users WHERE muted = 1 AND mute_until IS NOT NULL AND mute_until <= ?
+             ORDER BY id",
         )
         .bind(now)
         .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Ends expired silence and queues the report together; false when it was not expired.
+    pub async fn end_mute(&self, id: i64, now: i64, report: Option<&Outgoing>) -> Result<bool> {
+        let mut tx = self.write_tx().await?;
+        let blocked: Option<Option<i64>> = sqlx::query_scalar(
+            "UPDATE users SET muted = 0, mute_until = NULL
+             WHERE id = ? AND muted = 1 AND mute_until IS NOT NULL AND mute_until <= ?
+             RETURNING blocked_at",
+        )
+        .bind(id)
+        .bind(now)
+        .fetch_optional(&mut *tx)
         .await?;
-        let mut out = Vec::new();
-        for r in rows {
-            let blocked: Option<i64> = r.try_get("blocked_at")?;
-            if blocked.is_none() {
-                out.push(r.try_get("id")?);
-            }
+        let Some(blocked) = blocked else {
+            return Ok(false);
+        };
+        if blocked.is_none()
+            && let Some(m) = report
+        {
+            insert_msgs(&mut tx, std::slice::from_ref(m), now).await?;
         }
-        Ok(out)
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn set_tz(&self, id: i64, tz: &str) -> Result<()> {
@@ -372,6 +453,32 @@ impl Db {
         Ok(())
     }
 
+    /// Removes a user who still blocks the bot since before `cutoff`.
+    async fn forget_blocked(&self, id: i64, cutoff: i64) -> Result<bool> {
+        let mut tx = self.write_tx().await?;
+        let gone = sqlx::query(
+            "DELETE FROM users WHERE id = ? AND blocked_at IS NOT NULL AND blocked_at < ?",
+        )
+        .bind(id)
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if gone {
+            sqlx::query("DELETE FROM queue WHERE chat_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM subscriptions WHERE user_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(gone)
+    }
+
     pub async fn broadcast_targets(&self) -> Result<Vec<i64>> {
         Ok(
             sqlx::query_scalar("SELECT id FROM users WHERE blocked_at IS NULL ORDER BY id")
@@ -428,36 +535,70 @@ impl Db {
         .flatten())
     }
 
-    /// Marks the station as deleted; false when it already was.
-    pub async fn mark_gone(&self, uuid: &str, now: i64) -> Result<bool> {
+    /// Marks the station as deleted and queues the notices together; false when it already was.
+    pub async fn mark_gone(&self, uuid: &str, now: i64, notices: &[Outgoing]) -> Result<bool> {
+        let mut tx = self.write_tx().await?;
         let r = sqlx::query("UPDATE stations SET gone_at = ? WHERE uuid = ? AND gone_at IS NULL")
             .bind(now)
             .bind(uuid)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        Ok(r.rows_affected() > 0)
+        if r.rows_affected() == 0 {
+            return Ok(false);
+        }
+        insert_msgs(&mut tx, notices, now).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
-    /// Removes subscriptions to stations deleted before `cutoff` and returns them.
-    pub async fn take_expired_gone(&self, cutoff: i64) -> Result<Vec<SubRow>> {
+    /// Subscriptions to stations deleted before `cutoff`.
+    pub async fn expired_gone_subs(&self, cutoff: i64) -> Result<Vec<SubRow>> {
         let rows = sqlx::query(AssertSqlSafe(format!(
             "{SUB_SELECT} WHERE st.gone_at IS NOT NULL AND st.gone_at < ? ORDER BY s.id"
         )))
         .bind(cutoff)
         .fetch_all(&self.pool)
         .await?;
-        let subs: Vec<SubRow> = rows.iter().map(sub_row).collect::<Result<_>>()?;
-        for s in &subs {
-            sqlx::query("DELETE FROM subscriptions WHERE id = ?")
-                .bind(s.id)
-                .execute(&self.pool)
-                .await?;
-        }
-        Ok(subs)
+        rows.iter().map(sub_row).collect()
     }
 
-    pub async fn apply_snapshot(&self, snap: &Snapshot, now: i64) -> Result<Applied> {
-        let mut tx = self.pool.begin().await?;
+    /// Removes the subscription if its station is still deleted since before `cutoff`,
+    /// queueing the notice together; false when nothing was removed.
+    pub async fn remove_gone_sub(
+        &self,
+        id: i64,
+        cutoff: i64,
+        notice: Option<&Outgoing>,
+        now: i64,
+    ) -> Result<bool> {
+        let mut tx = self.write_tx().await?;
+        let r = sqlx::query(
+            "DELETE FROM subscriptions WHERE id = ? AND station IN
+                (SELECT uuid FROM stations WHERE gone_at IS NOT NULL AND gone_at < ?)",
+        )
+        .bind(id)
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?;
+        if r.rows_affected() == 0 {
+            return Ok(false);
+        }
+        if let Some(m) = notice {
+            insert_msgs(&mut tx, std::slice::from_ref(m), now).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Stores a snapshot. `on_return` is queued in the same transaction when the station
+    /// was marked as deleted.
+    pub async fn apply_snapshot(
+        &self,
+        snap: &Snapshot,
+        now: i64,
+        on_return: &[Outgoing],
+    ) -> Result<Applied> {
+        let mut tx = self.write_tx().await?;
         let old_row = sqlx::query("SELECT * FROM stations WHERE uuid = ?")
             .bind(&snap.uuid)
             .fetch_optional(&mut *tx)
@@ -467,6 +608,19 @@ impl Db {
             .map(|r| r.try_get("raw_state"))
             .transpose()?;
         let old = old_row.as_ref().map(|r| station_row(r, "")).transpose()?;
+        if let Some(o) = &old
+            && o.checked_at.is_some_and(|c| c > snap.fetched_at)
+        {
+            return Ok(Applied {
+                new: o.clone(),
+                old,
+                status_changed: false,
+                game_changed_while_busy: false,
+                session_started: false,
+                returned: false,
+                stale: true,
+            });
+        }
         let status_changed = old.as_ref().is_none_or(|o| o.status != snap.status);
         let game_changed_while_busy = old.as_ref().is_some_and(|o| {
             o.status == crate::drova::Status::Busy
@@ -486,9 +640,10 @@ impl Db {
         sqlx::query(
             "INSERT INTO stations (uuid, name, status, raw_state, published, city, product_id, games_count,
                 status_since, checked_at, description)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, COALESCE(?, 1), ?, ?, ?, ?, ?, ?)
              ON CONFLICT(uuid) DO UPDATE SET name = excluded.name, status = excluded.status,
-                raw_state = excluded.raw_state, published = excluded.published, city = excluded.city,
+                raw_state = excluded.raw_state, published = COALESCE(?, stations.published),
+                city = excluded.city,
                 product_id = COALESCE(excluded.product_id, stations.product_id),
                 games_count = excluded.games_count, status_since = excluded.status_since,
                 checked_at = excluded.checked_at, description = excluded.description,
@@ -503,10 +658,15 @@ impl Db {
         .bind(&snap.product_id)
         .bind(snap.games_count)
         .bind(status_since)
-        .bind(now)
+        .bind(snap.fetched_at)
         .bind(&snap.description)
+        .bind(snap.published)
         .execute(&mut *tx)
         .await?;
+        let returned = old.as_ref().is_some_and(|o| o.gone_at.is_some());
+        if returned {
+            insert_msgs(&mut tx, on_return, now).await?;
+        }
         if status_changed || game_changed_while_busy {
             sqlx::query(
                 "INSERT INTO transitions (station, from_status, to_status, product_id, at) VALUES (?, ?, ?, ?, ?)",
@@ -530,7 +690,8 @@ impl Db {
             status_changed,
             game_changed_while_busy,
             session_started,
-            returned: old.as_ref().is_some_and(|o| o.gone_at.is_some()),
+            returned,
+            stale: false,
             old,
         })
     }
@@ -575,16 +736,26 @@ impl Db {
         Ok(out)
     }
 
+    /// Adds or refreshes a subscription; the waiting state comes from the stored station.
     pub async fn add_subscription(
         &self,
         user_id: i64,
         uuid: &str,
-        last_status: Status,
-        pending: bool,
+        merchant: bool,
         limit: i64,
         now: i64,
     ) -> Result<AddResult> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_tx().await?;
+        let st = sqlx::query("SELECT * FROM stations WHERE uuid = ?")
+            .bind(uuid)
+            .fetch_optional(&mut *tx)
+            .await?
+            .as_ref()
+            .map(|r| station_row(r, ""))
+            .transpose()?
+            .with_context(|| format!("station {uuid} is not stored"))?;
+        let last_status = st.status;
+        let pending = pending_for(merchant, st.status, st.published);
         let existing: Option<i64> =
             sqlx::query_scalar("SELECT id FROM subscriptions WHERE user_id = ? AND station = ?")
                 .bind(user_id)
@@ -721,22 +892,6 @@ impl Db {
         Ok(())
     }
 
-    pub async fn mark_subs_ready(&self, ids: &[i64]) -> Result<()> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let sql = format!(
-            "UPDATE subscriptions SET last_status = 'ready', pending = 0 WHERE id IN ({})",
-            in_list(ids.len())
-        );
-        let mut q = sqlx::query(AssertSqlSafe(sql));
-        for id in ids {
-            q = q.bind(id);
-        }
-        q.execute(&self.pool).await?;
-        Ok(())
-    }
-
     /// Other users actively waiting for each station: not muted, not blocked.
     pub async fn waiting_counts(&self, user_id: i64, now: i64) -> Result<HashMap<String, i64>> {
         let rows = sqlx::query(
@@ -857,28 +1012,44 @@ impl Db {
 
     // Queue
 
-    pub async fn enqueue(
-        &self,
-        kind: &str,
-        chat_id: i64,
-        station: Option<&str>,
-        text: &str,
-        keyboard: Option<&str>,
-        not_before: i64,
-    ) -> Result<i64> {
-        Ok(sqlx::query_scalar(
-            "INSERT INTO queue (kind, chat_id, station, text, keyboard, not_before, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+    /// Queues all messages or none.
+    pub async fn enqueue_all(&self, msgs: &[Outgoing], now: i64) -> Result<()> {
+        if msgs.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.write_tx().await?;
+        insert_msgs(&mut tx, msgs, now).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Queues free-station messages and marks the subscriptions as notified in one step.
+    pub async fn enqueue_ready(&self, msgs: &[Outgoing], done: &[i64], now: i64) -> Result<()> {
+        let mut tx = self.write_tx().await?;
+        insert_msgs(&mut tx, msgs, now).await?;
+        if !done.is_empty() {
+            let sql = format!(
+                "UPDATE subscriptions SET last_status = 'ready', pending = 0 WHERE id IN ({})",
+                in_list(done.len())
+            );
+            let mut q = sqlx::query(AssertSqlSafe(sql));
+            for id in done {
+                q = q.bind(id);
+            }
+            q.execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn is_pending(&self, id: i64) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT 1 FROM queue WHERE id = ? AND state = 'pending'")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?
+                .is_some(),
         )
-        .bind(kind)
-        .bind(chat_id)
-        .bind(station)
-        .bind(text)
-        .bind(keyboard)
-        .bind(not_before)
-        .bind(crate::util::now())
-        .fetch_one(&self.pool)
-        .await?)
     }
 
     pub async fn due(&self, now: i64, limit: i64) -> Result<Vec<QueueRow>> {
@@ -965,8 +1136,8 @@ impl Db {
     }
 
     /// Free-station messages for this station from the last `window` seconds.
-    /// Undelivered ones are dropped; delivered ones are returned for the "taken" edit.
-    pub async fn take_recent_free_messages(
+    /// Undelivered ones are dropped; delivered ones that still need the "taken" edit are returned.
+    pub async fn recent_free_messages(
         &self,
         uuid: &str,
         window: i64,
@@ -981,10 +1152,9 @@ impl Db {
         .execute(&self.pool)
         .await?;
         let rows = sqlx::query(
-            "UPDATE queue SET taken_edited = 1
+            "SELECT id, chat_id, message_id, text FROM queue
              WHERE station = ? AND kind IN ('ready', 'merchant_ready') AND state = 'sent'
-               AND taken_edited = 0 AND message_id IS NOT NULL AND done_at >= ?
-             RETURNING id, chat_id, message_id, text",
+               AND taken_edited = 0 AND message_id IS NOT NULL AND done_at >= ?",
         )
         .bind(uuid)
         .bind(now - window)
@@ -1002,6 +1172,14 @@ impl Db {
             .collect()
     }
 
+    pub async fn mark_taken_edited(&self, id: i64) -> Result<()> {
+        sqlx::query("UPDATE queue SET taken_edited = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn sent_text(&self, chat_id: i64, message_id: i64) -> Result<Option<String>> {
         Ok(sqlx::query_scalar(
             "SELECT text FROM queue WHERE chat_id = ? AND message_id = ? ORDER BY id DESC LIMIT 1",
@@ -1014,16 +1192,40 @@ impl Db {
 
     // Campaigns
 
-    pub async fn create_campaign(&self, kind: &str, due_at: i64, now: i64) -> Result<bool> {
+    pub async fn campaign_exists(&self, kind: &str, due_at: i64) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT 1 FROM campaigns WHERE kind = ? AND due_at = ?")
+                .bind(kind)
+                .bind(due_at)
+                .fetch_optional(&self.pool)
+                .await?
+                .is_some(),
+        )
+    }
+
+    /// Records the campaign and queues its messages together; false when it already ran.
+    pub async fn start_campaign(
+        &self,
+        kind: &str,
+        due_at: i64,
+        now: i64,
+        msgs: &[Outgoing],
+    ) -> Result<bool> {
+        let mut tx = self.write_tx().await?;
         let r = sqlx::query(
             "INSERT OR IGNORE INTO campaigns (kind, due_at, created_at) VALUES (?, ?, ?)",
         )
         .bind(kind)
         .bind(due_at)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(r.rows_affected() > 0)
+        if r.rows_affected() == 0 {
+            return Ok(false);
+        }
+        insert_msgs(&mut tx, msgs, now).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     // Poll errors and stats
@@ -1115,8 +1317,14 @@ impl Db {
         .bind(now - BLOCKED_KEEP_DAYS * day)
         .fetch_all(&self.pool)
         .await?;
+        let mut users = 0;
         for id in &blocked {
-            self.forget_user(*id).await?;
+            if self
+                .forget_blocked(*id, now - BLOCKED_KEEP_DAYS * day)
+                .await?
+            {
+                users += 1;
+            }
         }
         let old_stations: Vec<String> = sqlx::query_scalar(
             "SELECT uuid FROM stations WHERE uuid NOT IN (SELECT station FROM subscriptions)
@@ -1141,7 +1349,7 @@ impl Db {
             queue,
             transitions,
             poll_errors,
-            users: blocked.len() as u64,
+            users,
             stations: old_stations.len() as u64,
         })
     }
@@ -1246,37 +1454,55 @@ mod tests {
             raw_state: raw.into(),
             status,
             known_state: true,
-            published: true,
+            published: Some(true),
             city: None,
             product_id: product.map(Into::into),
             games_count: Some(3),
             description: Some("<p>hi</p>".into()),
+            fetched_at: 0,
         }
+    }
+
+    fn at(mut s: Snapshot, t: i64) -> Snapshot {
+        s.fetched_at = t;
+        s
+    }
+
+    fn msg(chat: i64, kind: &'static str) -> Outgoing {
+        Outgoing::new(kind, chat, None, "x", None).unwrap()
+    }
+
+    async fn queued(db: &Db, kind: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM queue WHERE kind = ? AND state = 'pending'")
+            .bind(kind)
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
     async fn snapshots_make_transitions() {
         let db = memory().await;
         let a = db
-            .apply_snapshot(&snap(Status::Ready, None), 100)
+            .apply_snapshot(&at(snap(Status::Ready, None), 100), 100, &[])
             .await
             .unwrap();
         assert!(a.status_changed && a.old.is_none());
         let a = db
-            .apply_snapshot(&snap(Status::Ready, None), 130)
+            .apply_snapshot(&at(snap(Status::Ready, None), 130), 130, &[])
             .await
             .unwrap();
         assert!(!a.status_changed);
         assert_eq!(a.new.status_since, 100);
-        db.apply_snapshot(&snap(Status::Busy, Some("g1")), 200)
+        db.apply_snapshot(&at(snap(Status::Busy, Some("g1")), 200), 200, &[])
             .await
             .unwrap();
         let a = db
-            .apply_snapshot(&snap(Status::Busy, Some("g2")), 260)
+            .apply_snapshot(&at(snap(Status::Busy, Some("g2")), 260), 260, &[])
             .await
             .unwrap();
         assert!(a.game_changed_while_busy && !a.status_changed);
-        db.apply_snapshot(&snap(Status::Ready, Some("g2")), 400)
+        db.apply_snapshot(&at(snap(Status::Ready, Some("g2")), 400), 400, &[])
             .await
             .unwrap();
         let t = db.transitions(&a.new.uuid, 150, 1000).await.unwrap();
@@ -1292,7 +1518,7 @@ mod tests {
         let db = memory().await;
         let apply = |s: Snapshot, t: i64| {
             let db = db.clone();
-            async move { db.apply_snapshot(&s, t).await.unwrap() }
+            async move { db.apply_snapshot(&at(s, t), t, &[]).await.unwrap() }
         };
         apply(snap_raw(Status::Busy, None, "BUSY"), 10).await;
         let a = apply(snap_raw(Status::Busy, Some("g1"), "BUSY"), 20).await;
@@ -1314,16 +1540,15 @@ mod tests {
         let db = memory().await;
         let uuid = "05225c83-dd3b-4c12-832b-48227262f960";
         db.touch_user(1, 0).await.unwrap();
-        db.apply_snapshot(&snap(Status::Ready, None), 0)
+        db.apply_snapshot(&at(snap(Status::Ready, None), 0), 0, &[])
             .await
             .unwrap();
-        db.add_subscription(1, uuid, Status::Ready, false, 5, 0)
-            .await
-            .unwrap();
+        db.add_subscription(1, uuid, false, 5, 0).await.unwrap();
         assert_eq!(db.mark_missing(uuid, 100).await.unwrap(), Some(100));
         assert_eq!(db.mark_missing(uuid, 200).await.unwrap(), Some(100));
-        assert!(db.mark_gone(uuid, 4_000).await.unwrap());
-        assert!(!db.mark_gone(uuid, 4_100).await.unwrap());
+        assert!(db.mark_gone(uuid, 4_000, &[msg(1, "gone")]).await.unwrap());
+        assert!(!db.mark_gone(uuid, 4_100, &[msg(1, "gone")]).await.unwrap());
+        assert_eq!(queued(&db, "gone").await, 1);
         assert_eq!(
             db.stations_to_poll().await.unwrap(),
             vec![(uuid.to_owned(), true)]
@@ -1332,15 +1557,36 @@ mod tests {
         assert_eq!(sub.station.gone_at, Some(4_000));
         assert_eq!(sub.station.description.as_deref(), Some("<p>hi</p>"));
         let a = db
-            .apply_snapshot(&snap(Status::Ready, None), 5_000)
+            .apply_snapshot(
+                &at(snap(Status::Ready, None), 5_000),
+                5_000,
+                &[msg(1, "returned")],
+            )
             .await
             .unwrap();
         assert!(a.returned && a.new.gone_at.is_none() && a.new.missing_since.is_none());
+        assert_eq!(queued(&db, "returned").await, 1);
         db.mark_missing(uuid, 6_000).await.unwrap();
-        db.mark_gone(uuid, 7_000).await.unwrap();
-        assert!(db.take_expired_gone(7_000).await.unwrap().is_empty());
-        let removed = db.take_expired_gone(7_001).await.unwrap();
-        assert_eq!(removed.len(), 1);
+        db.mark_gone(uuid, 7_000, &[]).await.unwrap();
+        assert!(db.expired_gone_subs(7_000).await.unwrap().is_empty());
+        let subs = db.expired_gone_subs(7_001).await.unwrap();
+        assert_eq!(subs.len(), 1);
+        db.apply_snapshot(&at(snap(Status::Ready, None), 7_500), 7_500, &[])
+            .await
+            .unwrap();
+        let notice = msg(1, "gone_unsub");
+        assert!(
+            !db.remove_gone_sub(subs[0].id, 7_001, Some(&notice), 7_600)
+                .await
+                .unwrap()
+        );
+        db.mark_gone(uuid, 7_000, &[]).await.unwrap();
+        assert!(
+            db.remove_gone_sub(subs[0].id, 7_001, Some(&notice), 7_600)
+                .await
+                .unwrap()
+        );
+        assert_eq!(queued(&db, "gone_unsub").await, 1);
         assert!(db.subs_for_user(1).await.unwrap().is_empty());
         assert_eq!(db.stations_to_poll().await.unwrap(), Vec::new());
     }
@@ -1349,19 +1595,13 @@ mod tests {
     async fn subscription_limit_and_views() {
         let db = memory().await;
         db.touch_user(1, 0).await.unwrap();
-        db.apply_snapshot(&snap(Status::Busy, None), 0)
+        db.apply_snapshot(&at(snap(Status::Busy, None), 0), 0, &[])
             .await
             .unwrap();
         let uuid = "05225c83-dd3b-4c12-832b-48227262f960";
-        let r = db
-            .add_subscription(1, uuid, Status::Busy, true, 1, 0)
-            .await
-            .unwrap();
+        let r = db.add_subscription(1, uuid, false, 1, 0).await.unwrap();
         assert!(matches!(r, AddResult::Added(_)));
-        let r = db
-            .add_subscription(1, uuid, Status::Busy, true, 1, 0)
-            .await
-            .unwrap();
+        let r = db.add_subscription(1, uuid, false, 1, 0).await.unwrap();
         assert!(matches!(r, AddResult::Updated(_)));
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM monitoring WHERE url LIKE 'https://drova.io/stations/%'",
@@ -1386,26 +1626,19 @@ mod tests {
         let db = memory().await;
         let day = 86_400;
         let now = 200 * day;
-        db.apply_snapshot(&snap(Status::Ready, None), 10 * day)
+        db.apply_snapshot(&at(snap(Status::Ready, None), 10 * day), 10 * day, &[])
             .await
             .unwrap();
-        db.apply_snapshot(&snap(Status::Busy, None), 20 * day)
+        db.apply_snapshot(&at(snap(Status::Busy, None), 20 * day), 20 * day, &[])
             .await
             .unwrap();
-        db.apply_snapshot(&snap(Status::Ready, None), 190 * day)
+        db.apply_snapshot(&at(snap(Status::Ready, None), 190 * day), 190 * day, &[])
             .await
             .unwrap();
         db.touch_user(1, 0).await.unwrap();
-        db.add_subscription(
-            1,
-            "05225c83-dd3b-4c12-832b-48227262f960",
-            Status::Ready,
-            false,
-            5,
-            0,
-        )
-        .await
-        .unwrap();
+        db.add_subscription(1, "05225c83-dd3b-4c12-832b-48227262f960", false, 5, 0)
+            .await
+            .unwrap();
         let p = db.prune(now).await.unwrap();
         assert_eq!(p.transitions, 1);
         let t = db
@@ -1414,5 +1647,68 @@ mod tests {
             .unwrap();
         assert_eq!(t.len(), 2);
         assert_eq!(t[0].to, Status::Busy);
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_and_missing_flag() {
+        let db = memory().await;
+        db.apply_snapshot(&at(snap(Status::Busy, None), 100), 100, &[])
+            .await
+            .unwrap();
+        let a = db
+            .apply_snapshot(&at(snap(Status::Ready, None), 90), 110, &[])
+            .await
+            .unwrap();
+        assert!(a.stale);
+        assert_eq!(a.new.status, Status::Busy);
+        let mut hidden = at(snap(Status::Busy, None), 120);
+        hidden.published = Some(false);
+        db.apply_snapshot(&hidden, 120, &[]).await.unwrap();
+        let mut unknown = at(snap(Status::Busy, None), 130);
+        unknown.published = None;
+        let a = db.apply_snapshot(&unknown, 130, &[]).await.unwrap();
+        assert!(!a.stale && !a.new.published);
+    }
+
+    #[tokio::test]
+    async fn waiting_state_comes_from_station() {
+        let db = memory().await;
+        let uuid = "05225c83-dd3b-4c12-832b-48227262f960";
+        db.touch_user(1, 0).await.unwrap();
+        db.apply_snapshot(&at(snap(Status::Ready, None), 10), 10, &[])
+            .await
+            .unwrap();
+        db.add_subscription(1, uuid, false, 5, 0).await.unwrap();
+        assert!(!db.subs_for_user(1).await.unwrap()[0].pending);
+        db.apply_snapshot(&at(snap(Status::Busy, None), 20), 20, &[])
+            .await
+            .unwrap();
+        db.add_subscription(1, uuid, false, 5, 0).await.unwrap();
+        let sub = db.subs_for_user(1).await.unwrap().remove(0);
+        assert!(sub.pending && sub.last_status == Status::Busy);
+        db.enqueue_ready(&[msg(1, "ready")], &[sub.id], 30)
+            .await
+            .unwrap();
+        assert!(!db.subs_for_user(1).await.unwrap()[0].pending);
+        assert_eq!(queued(&db, "ready").await, 1);
+    }
+
+    #[tokio::test]
+    async fn mute_end_and_blocked_prune_check_state() {
+        let db = memory().await;
+        db.touch_user(1, 0).await.unwrap();
+        db.set_mute(1, Some(100)).await.unwrap();
+        assert_eq!(db.expired_mutes(50).await.unwrap(), Vec::<i64>::new());
+        assert_eq!(db.expired_mutes(100).await.unwrap(), vec![1]);
+        let report = msg(1, "unmute_report");
+        assert!(db.end_mute(1, 100, Some(&report)).await.unwrap());
+        assert!(!db.end_mute(1, 100, Some(&report)).await.unwrap());
+        assert_eq!(queued(&db, "unmute_report").await, 1);
+        db.mark_blocked(1, 10).await.unwrap();
+        db.touch_user(1, 20).await.unwrap();
+        assert!(!db.forget_blocked(1, 1_000).await.unwrap());
+        db.mark_blocked(1, 30).await.unwrap();
+        assert!(db.forget_blocked(1, 1_000).await.unwrap());
+        assert!(db.user(1).await.unwrap().is_none());
     }
 }

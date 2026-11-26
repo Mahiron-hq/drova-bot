@@ -86,7 +86,10 @@ pub fn stats(items: &[Interval], tz: &TimeZone) -> Stats {
         match i.status {
             Status::Busy => {
                 s.busy += len;
-                sessions.push(len);
+                // A session still in progress has no final length yet.
+                if i.next.is_some() {
+                    sessions.push(len);
+                }
                 if let Some(p) = &i.product_id {
                     let e = games.entry(p.clone()).or_default();
                     e.0 += 1;
@@ -219,6 +222,9 @@ mod tests {
         assert_eq!(s.load, Some(45));
         assert_eq!(s.top_games[0].0, "a");
         assert_eq!(s.peak_hours[0], (1, 100));
+        let open = stats(&intervals(&rows[..4], 0, 14_400), &TimeZone::UTC);
+        assert_eq!(open.sessions, 1);
+        assert_eq!(open.avg_session, Some(3600));
     }
 
     #[test]

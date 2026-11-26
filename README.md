@@ -115,10 +115,11 @@ This is needed only to run your own copy of the bot. Requirements: Linux x86_64 
 1. Download `drova-bot-<version>-linux-x86_64.tar.gz` and `SHA256SUMS.txt` from [Releases](https://github.com/Mahiron-hq/drova-bot/releases/latest) and check the hash: `sha256sum -c SHA256SUMS.txt --ignore-missing`.
 2. Unpack and install the binary: `sudo install -m 755 drova-bot /usr/local/bin/drova-bot`.
 3. Create a user and a data folder: `sudo useradd --system --home /var/lib/drova-bot drova-bot && sudo install -d -o drova-bot -m 750 /var/lib/drova-bot`.
-4. Copy [`deploy/drova-bot.env.example`](deploy/drova-bot.env.example) to `/etc/drova-bot/drova-bot.env`, set `BOT_TOKEN` and `ADMIN_IDS`, and make the file readable only by root (`chmod 600`).
-5. Install [`deploy/drova-bot.service`](deploy/drova-bot.service) into `/etc/systemd/system/` and run `sudo systemctl enable --now drova-bot`.
+4. Create the config: `sudo install -d -m 755 /etc/drova-bot && sudo install -m 600 deploy/drova-bot.env.example /etc/drova-bot/drova-bot.env`, then set `BOT_TOKEN` and `ADMIN_IDS` in it. The file stays readable only by root.
+5. Install [`deploy/drova-bot.service`](deploy/drova-bot.service) into `/etc/systemd/system/` and run `sudo systemctl daemon-reload && sudo systemctl enable --now drova-bot`.
+6. Daily backups (recommended): install `sqlite3` (`sudo apt install sqlite3`), then `sudo install -m 755 deploy/drova-backup /usr/local/sbin/drova-backup`, copy [`drova-backup.service`](deploy/drova-backup.service) and [`drova-backup.timer`](deploy/drova-backup.timer) into `/etc/systemd/system/` and run `sudo systemctl daemon-reload && sudo systemctl enable --now drova-backup.timer`. Check it once with `sudo systemctl start drova-backup && ls -l /var/backups/drova-bot`. If `DATABASE_PATH` differs from the example, set `Environment=SRC=<path>` in the service. To restore, stop the bot, copy a backup over the database file, delete the `-wal` and `-shm` files next to it, give it to the `drova-bot` user and start the bot.
 
-Logs: `journalctl -u drova-bot -f`. Backups: [`deploy/drova-backup`](deploy/drova-backup) with its timer makes a daily consistent copy of the database.
+Logs: `journalctl -u drova-bot -f`.
 
 #### Moving from the Python bot
 
@@ -271,10 +272,11 @@ Drova Bot следит за станциями сервиса облачного
 1. Скачайте `drova-bot-<версия>-linux-x86_64.tar.gz` и `SHA256SUMS.txt` из [релизов](https://github.com/Mahiron-hq/drova-bot/releases/latest) и проверьте хеш: `sha256sum -c SHA256SUMS.txt --ignore-missing`.
 2. Распакуйте и установите бинарник: `sudo install -m 755 drova-bot /usr/local/bin/drova-bot`.
 3. Создайте пользователя и папку данных: `sudo useradd --system --home /var/lib/drova-bot drova-bot && sudo install -d -o drova-bot -m 750 /var/lib/drova-bot`.
-4. Скопируйте [`deploy/drova-bot.env.example`](deploy/drova-bot.env.example) в `/etc/drova-bot/drova-bot.env`, укажите `BOT_TOKEN` и `ADMIN_IDS` и оставьте файл доступным только root (`chmod 600`).
-5. Установите [`deploy/drova-bot.service`](deploy/drova-bot.service) в `/etc/systemd/system/` и выполните `sudo systemctl enable --now drova-bot`.
+4. Создайте настройки: `sudo install -d -m 755 /etc/drova-bot && sudo install -m 600 deploy/drova-bot.env.example /etc/drova-bot/drova-bot.env`, затем укажите в файле `BOT_TOKEN` и `ADMIN_IDS`. Файл остаётся доступным только root.
+5. Установите [`deploy/drova-bot.service`](deploy/drova-bot.service) в `/etc/systemd/system/` и выполните `sudo systemctl daemon-reload && sudo systemctl enable --now drova-bot`.
+6. Ежедневные резервные копии (рекомендуется): установите `sqlite3` (`sudo apt install sqlite3`), затем `sudo install -m 755 deploy/drova-backup /usr/local/sbin/drova-backup`, скопируйте [`drova-backup.service`](deploy/drova-backup.service) и [`drova-backup.timer`](deploy/drova-backup.timer) в `/etc/systemd/system/` и выполните `sudo systemctl daemon-reload && sudo systemctl enable --now drova-backup.timer`. Проверьте один раз: `sudo systemctl start drova-backup && ls -l /var/backups/drova-bot`. Если `DATABASE_PATH` отличается от примера, укажите в сервисе `Environment=SRC=<путь>`. Для восстановления остановите бота, скопируйте копию поверх файла базы, удалите рядом файлы `-wal` и `-shm`, отдайте его пользователю `drova-bot` и запустите бота.
 
-Логи: `journalctl -u drova-bot -f`. Бэкапы: [`deploy/drova-backup`](deploy/drova-backup) с таймером каждый день делает целостную копию базы.
+Логи: `journalctl -u drova-bot -f`.
 
 #### Переход с Python-бота
 

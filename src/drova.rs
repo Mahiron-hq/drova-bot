@@ -4,7 +4,7 @@ use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, HeaderMap, HeaderValue, PRAGMA};
 use serde::Deserialize;
 
-use crate::util::is_uuid;
+use crate::util::{is_uuid, now};
 
 const API_BASE: &str = "https://services.drova.io";
 const MAX_BODY: usize = 2 * 1024 * 1024;
@@ -56,12 +56,15 @@ pub struct Snapshot {
     pub raw_state: String,
     pub status: Status,
     pub known_state: bool,
-    pub published: bool,
+    /// `None` when Drova did not send a boolean.
+    pub published: Option<bool>,
     pub city: Option<String>,
     pub product_id: Option<String>,
     pub games_count: Option<i64>,
     /// Raw HTML from the merchant.
     pub description: Option<String>,
+    /// When the request was sent; an older snapshot never replaces a newer one.
+    pub fetched_at: i64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -182,10 +185,15 @@ impl DrovaClient {
         if !is_uuid(uuid) {
             return Err(DrovaError::Parse("неверный UUID".to_owned()));
         }
+        let fetched_at = now();
         let raw: RawStation = self
             .get_json(&format!("{API_BASE}/server-manager/servers/public/{uuid}"))
             .await?;
-        parse_station(raw)
+        let snap = parse_station(raw, fetched_at)?;
+        if !snap.uuid.eq_ignore_ascii_case(uuid) {
+            return Err(DrovaError::Parse("ответ о другой станции".to_owned()));
+        }
+        Ok(snap)
     }
 
     /// Station hardware; `None` when Drova has no data for the station.
@@ -245,7 +253,7 @@ fn describe(e: &reqwest::Error) -> String {
     text
 }
 
-fn parse_station(raw: RawStation) -> Result<Snapshot, DrovaError> {
+fn parse_station(raw: RawStation, fetched_at: i64) -> Result<Snapshot, DrovaError> {
     let uuid = raw
         .uuid
         .map(|u| u.to_ascii_lowercase())
@@ -263,8 +271,8 @@ fn parse_station(raw: RawStation) -> Result<Snapshot, DrovaError> {
         .ok_or_else(|| DrovaError::Parse("нет состояния".to_owned()))?;
     let (status, known_state) = Status::from_raw(&raw_state);
     let published = match raw.published {
-        Some(serde_json::Value::Bool(b)) => b,
-        _ => true,
+        Some(serde_json::Value::Bool(b)) => Some(b),
+        _ => None,
     };
     Ok(Snapshot {
         uuid,
@@ -286,6 +294,7 @@ fn parse_station(raw: RawStation) -> Result<Snapshot, DrovaError> {
             .description
             .filter(|d| !d.trim().is_empty())
             .map(|d| d.chars().take(MAX_DESCRIPTION).collect()),
+        fetched_at,
     })
 }
 
@@ -336,12 +345,13 @@ mod tests {
             r#"{"uuid":"05225C83-dd3b-4c12-832b-48227262f960","name":" PC ","state":"LISTEN",
             "published":false,"city_name":"St Petersburg","product_id":"b05acb00-93ab-4b6d-ab6c-792f72e43665",
             "product_list":["a","b"],"extra":1}"#,
-        ))
+        ), 7)
         .unwrap();
         assert_eq!(s.uuid, "05225c83-dd3b-4c12-832b-48227262f960");
         assert_eq!(s.name, "PC");
         assert_eq!(s.status, Status::Ready);
-        assert!(!s.published);
+        assert_eq!(s.published, Some(false));
+        assert_eq!(s.fetched_at, 7);
         assert_eq!(s.games_count, Some(2));
         assert_eq!(s.city.as_deref(), Some("St Petersburg"));
     }
@@ -375,11 +385,12 @@ mod tests {
 
     #[test]
     fn rejects_broken_station() {
-        assert!(parse_station(raw(r#"{"uuid":"x","name":"a","state":"BUSY"}"#)).is_err());
+        assert!(parse_station(raw(r#"{"uuid":"x","name":"a","state":"BUSY"}"#), 0).is_err());
         assert!(
-            parse_station(raw(
-                r#"{"uuid":"05225c83-dd3b-4c12-832b-48227262f960","name":"","state":"BUSY"}"#
-            ))
+            parse_station(
+                raw(r#"{"uuid":"05225c83-dd3b-4c12-832b-48227262f960","name":"","state":"BUSY"}"#),
+                0
+            )
             .is_err()
         );
     }
@@ -388,11 +399,11 @@ mod tests {
     fn unknown_state_is_offline_and_flagged() {
         let s = parse_station(raw(
             r#"{"uuid":"05225c83-dd3b-4c12-832b-48227262f960","name":"a","state":"WEIRD","published":"yes","product_id":"bad"}"#,
-        ))
+        ), 0)
         .unwrap();
         assert_eq!(s.status, Status::Offline);
         assert!(!s.known_state);
-        assert!(s.published);
+        assert_eq!(s.published, None);
         assert_eq!(s.product_id, None);
         assert_eq!(Status::from_raw("handshake").0, Status::Busy);
         assert_eq!(Status::from_raw("LISTEN"), (Status::Ready, true));

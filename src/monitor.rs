@@ -8,7 +8,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::app::App;
-use crate::db::{Applied, GONE_AFTER, StationRow};
+use crate::db::{Applied, GONE_AFTER, Outgoing, StationRow};
 use crate::drova::{DrovaError, Snapshot, Status};
 use crate::keyboards as kb;
 use crate::telegram::TgError;
@@ -29,6 +29,7 @@ pub struct Monitor {
     pending_up: HashSet<String>,
     last_digest: Option<i64>,
     unknown_states: HashSet<String>,
+    published_missing: bool,
     gone_polled: HashMap<String, i64>,
     backoff: u32,
 }
@@ -43,6 +44,7 @@ impl Monitor {
             pending_up: HashSet::new(),
             last_digest: None,
             unknown_states: HashSet::new(),
+            published_missing: false,
             gone_polled: HashMap::new(),
             backoff: 1,
         }
@@ -139,7 +141,7 @@ impl Monitor {
             tracing::warn!(error = %err, "Drova API looks down");
             self.app.health.api_down.store(true, Ordering::Relaxed);
             self.admin_alert(&texts::api_down(&err)).await;
-        } else if !api_down && was_down && ok > 0 {
+        } else if !api_down && was_down && active_ok > 0 {
             tracing::info!("Drova API is back");
             self.app.health.api_down.store(false, Ordering::Relaxed);
             self.backoff = 1;
@@ -152,7 +154,7 @@ impl Monitor {
         for (uuid, r) in results {
             match r {
                 Ok(snap) => {
-                    if let Err(e) = self.process(&snap).await {
+                    if let Err(e) = self.process(&snap, gone.contains(&uuid)).await {
                         tracing::error!(uuid, error = format!("{e:#}"), "cannot process snapshot");
                     }
                 }
@@ -209,7 +211,27 @@ impl Monitor {
         let Some(since) = self.app.db.mark_missing(uuid, t).await? else {
             return Ok(());
         };
-        if mass || t - since < GONE_AFTER || !self.app.db.mark_gone(uuid, t).await? {
+        if mass || t - since < GONE_AFTER {
+            return Ok(());
+        }
+        let Some(st) = self.app.db.station(uuid).await? else {
+            return Ok(());
+        };
+        let mut notices = Vec::new();
+        for (sub, user) in self.app.db.subs_for_station(uuid).await? {
+            if user.blocked_at.is_some() {
+                continue;
+            }
+            let text = texts::station_gone(&st.name, uuid, t - since, sub.comment.as_deref());
+            notices.push(Outgoing::new(
+                "gone",
+                user.id,
+                Some(uuid),
+                text,
+                Some(&kb::gone(sub.id)),
+            )?);
+        }
+        if !self.app.db.mark_gone(uuid, t, &notices).await? {
             return Ok(());
         }
         self.streaks.remove(uuid);
@@ -217,19 +239,7 @@ impl Monitor {
         self.pending_down.remove(uuid);
         self.pending_up.remove(uuid);
         self.gone_polled.insert(uuid.to_owned(), t);
-        let Some(st) = self.app.db.station(uuid).await? else {
-            return Ok(());
-        };
         tracing::info!(uuid, "station looks deleted");
-        for (sub, user) in self.app.db.subs_for_station(uuid).await? {
-            if user.blocked_at.is_some() {
-                continue;
-            }
-            let text = texts::station_gone(&st.name, uuid, t - since, sub.comment.as_deref());
-            self.app
-                .enqueue("gone", user.id, Some(uuid), &text, Some(&kb::gone(sub.id)))
-                .await?;
-        }
         self.app.wake_queue();
         Ok(())
     }
@@ -278,15 +288,20 @@ impl Monitor {
     }
 
     async fn admin_alert(&self, text: &str) {
-        for id in &self.app.cfg.admin_ids {
-            if let Err(e) = self.app.enqueue("admin", *id, None, text, None).await {
-                tracing::error!(error = %e, "cannot queue admin alert");
-            }
+        let msgs: Vec<Outgoing> = self
+            .app
+            .cfg
+            .admin_ids
+            .iter()
+            .filter_map(|id| Outgoing::new("admin", *id, None, text, None).ok())
+            .collect();
+        if let Err(e) = self.app.db.enqueue_all(&msgs, now()).await {
+            tracing::error!(error = %e, "cannot queue admin alert");
         }
         self.app.wake_queue();
     }
 
-    async fn process(&mut self, snap: &Snapshot) -> Result<()> {
+    async fn process(&mut self, snap: &Snapshot, was_gone: bool) -> Result<()> {
         self.on_success(&snap.uuid);
         if !snap.known_state
             && self
@@ -297,15 +312,29 @@ impl Monitor {
             self.admin_alert(&texts::unknown_state(&snap.raw_state, &snap.name))
                 .await;
         }
+        if snap.published.is_none() && !self.published_missing {
+            self.published_missing = true;
+            tracing::warn!(name = %snap.name, "Drova sent no published flag");
+            self.admin_alert(&texts::published_missing(&snap.name))
+                .await;
+        }
         if let Some(p) = &snap.product_id {
             self.app.title(p).await;
         }
         let t = now();
-        let applied = self.app.db.apply_snapshot(snap, t).await?;
+        let on_return = if was_gone {
+            returned_notices(&self.app, &snap.uuid, &snap.name).await?
+        } else {
+            Vec::new()
+        };
+        let applied = self.app.db.apply_snapshot(snap, t, &on_return).await?;
+        if applied.stale {
+            return Ok(());
+        }
         if applied.returned {
             tracing::info!(uuid = %snap.uuid, "deleted station is back");
             self.gone_polled.remove(&snap.uuid);
-            notify_returned(&self.app, &applied.new).await?;
+            self.app.wake_queue();
         }
         match applied.new.status {
             Status::Busy | Status::Offline => self.on_taken(&applied, t).await,
@@ -313,41 +342,56 @@ impl Monitor {
         }
     }
 
-    async fn on_taken(&self, a: &Applied, t: i64) -> Result<()> {
-        let st = &a.new;
-        self.app.db.set_station_waiting(&st.uuid, st.status).await?;
-        let Some(old) = &a.old else {
-            return Ok(());
-        };
-        let fresh = a.status_changed || a.game_changed_while_busy;
-        let session_started = a.session_started;
-        if !fresh && !session_started {
+    /// Marks recent "free" messages as taken; failed edits are retried on the next cycle.
+    async fn edit_taken(&self, st: &StationRow, t: i64) -> Result<()> {
+        let rows = self
+            .app
+            .db
+            .recent_free_messages(&st.uuid, TAKEN_WINDOW, t)
+            .await?;
+        if rows.is_empty() {
             return Ok(());
         }
         let game = match &st.product_id {
             Some(p) if st.status == Status::Busy => self.app.title(p).await,
             _ => None,
         };
-        if fresh {
-            let suffix = texts::taken_suffix(st.status, game.as_deref());
-            for (_, chat, message_id, text) in self
-                .app
-                .db
-                .take_recent_free_messages(&st.uuid, TAKEN_WINDOW, t)
-                .await?
-            {
-                let edited = texts::mark_taken(&text, &suffix);
-                match self.app.tg.edit(chat, message_id, &edited, None).await {
-                    Ok(()) | Err(TgError::Suppressed) => {}
-                    Err(TgError::Forbidden(_)) => self.app.db.mark_blocked(chat, t).await?,
-                    Err(e) => tracing::debug!(chat, error = %e, "cannot edit free message"),
+        let suffix = texts::taken_suffix(st.status, game.as_deref());
+        for (id, chat, message_id, text) in rows {
+            let edited = texts::mark_taken(&text, &suffix);
+            match self.app.tg.edit(chat, message_id, &edited, None).await {
+                Ok(()) | Err(TgError::Suppressed) => {}
+                Err(TgError::Forbidden(_)) => self.app.db.mark_blocked(chat, t).await?,
+                Err(TgError::BadRequest(e)) => {
+                    tracing::debug!(chat, error = %e, "free message cannot be edited");
+                }
+                Err(e) => {
+                    tracing::debug!(chat, error = %e, "cannot edit free message, will retry");
+                    continue;
                 }
             }
+            self.app.db.mark_taken_edited(id).await?;
         }
+        Ok(())
+    }
+
+    async fn on_taken(&self, a: &Applied, t: i64) -> Result<()> {
+        let st = &a.new;
+        self.app.db.set_station_waiting(&st.uuid, st.status).await?;
+        self.edit_taken(st, t).await?;
+        let Some(old) = &a.old else {
+            return Ok(());
+        };
+        let session_started = a.session_started;
         let went_offline = st.status == Status::Offline && old.status != Status::Offline;
         if !went_offline && !session_started {
             return Ok(());
         }
+        let game = match &st.product_id {
+            Some(p) if st.status == Status::Busy => self.app.title(p).await,
+            _ => None,
+        };
+        let mut msgs = Vec::new();
         for (sub, user) in self.app.db.subs_for_station(&st.uuid).await? {
             if !user.is_merchant || user.blocked_at.is_some() || user.mute_active(t) {
                 continue;
@@ -360,29 +404,26 @@ impl Monitor {
                     None
                 };
                 let text = texts::session_started(&st.name, &st.uuid, g, comment);
-                self.app
-                    .enqueue(
-                        "session_start",
-                        user.id,
-                        Some(&st.uuid),
-                        &text,
-                        Some(&kb::open_station(&st.uuid)),
-                    )
-                    .await?;
+                msgs.push(Outgoing::new(
+                    "session_start",
+                    user.id,
+                    Some(&st.uuid),
+                    text,
+                    Some(&kb::open_station(&st.uuid)),
+                )?);
             }
             if went_offline && sub.notify_offline {
                 let text = texts::went_offline(&st.name, &st.uuid, comment);
-                self.app
-                    .enqueue(
-                        "offline",
-                        user.id,
-                        Some(&st.uuid),
-                        &text,
-                        Some(&kb::open_station(&st.uuid)),
-                    )
-                    .await?;
+                msgs.push(Outgoing::new(
+                    "offline",
+                    user.id,
+                    Some(&st.uuid),
+                    text,
+                    Some(&kb::open_station(&st.uuid)),
+                )?);
             }
         }
+        self.app.db.enqueue_all(&msgs, t).await?;
         Ok(())
     }
 
@@ -408,7 +449,7 @@ impl Monitor {
             recipients.push((sub, user));
         }
         if recipients.is_empty() {
-            self.app.db.mark_subs_ready(&done).await?;
+            self.app.db.enqueue_ready(&[], &done, t).await?;
             return Ok(());
         }
         let session = self.app.db.last_session(&st.uuid).await?;
@@ -427,6 +468,7 @@ impl Monitor {
             "merchant_ready"
         };
         let keyboard = kb::notify(&st.uuid);
+        let mut msgs = Vec::with_capacity(recipients.len());
         for (sub, user) in &recipients {
             let text = texts::free_notification(&FreeInfo {
                 name: &st.name,
@@ -442,33 +484,36 @@ impl Monitor {
                 comment: sub.comment.as_deref(),
                 others,
             });
-            self.app
-                .enqueue(kind, user.id, Some(&st.uuid), &text, Some(&keyboard))
-                .await?;
+            msgs.push(Outgoing::new(
+                kind,
+                user.id,
+                Some(&st.uuid),
+                text,
+                Some(&keyboard),
+            )?);
         }
-        self.app.db.mark_subs_ready(&done).await?;
+        self.app.db.enqueue_ready(&msgs, &done, t).await?;
         tracing::info!(uuid = %st.uuid, recipients = recipients.len(), kind, "free notifications queued");
         self.app.wake_queue();
         Ok(())
     }
 }
 
-/// Tells subscribers that a station marked as deleted is on Drova again.
-pub async fn notify_returned(app: &App, st: &StationRow) -> Result<()> {
-    for (sub, user) in app.db.subs_for_station(&st.uuid).await? {
+/// Messages telling subscribers that a station marked as deleted is on Drova again.
+pub async fn returned_notices(app: &App, uuid: &str, name: &str) -> Result<Vec<Outgoing>> {
+    let mut out = Vec::new();
+    for (sub, user) in app.db.subs_for_station(uuid).await? {
         if user.blocked_at.is_some() {
             continue;
         }
-        let text = texts::station_returned(&st.name, &st.uuid, sub.comment.as_deref());
-        app.enqueue(
+        let text = texts::station_returned(name, uuid, sub.comment.as_deref());
+        out.push(Outgoing::new(
             "returned",
             user.id,
-            Some(&st.uuid),
-            &text,
-            Some(&kb::open_station(&st.uuid)),
-        )
-        .await?;
+            Some(uuid),
+            text,
+            Some(&kb::open_station(uuid)),
+        )?);
     }
-    app.wake_queue();
-    Ok(())
+    Ok(out)
 }

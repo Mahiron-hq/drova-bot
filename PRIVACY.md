@@ -35,11 +35,12 @@ The data is stored on a server in Switzerland. It is not sold or shared with any
 - Sent and dropped notifications: up to 30 days.
 - Station status history: up to 90 days.
 - If you block the bot, your data is deleted 90 days later. If you come back earlier, your subscriptions are restored.
-- Daily backups of the database are kept for 7 days. The owner also receives a weekly copy of the database in a private Telegram chat for disaster recovery.
+- Daily backups of the database are kept for 7 days. The owner also receives a weekly copy of the database in a private Telegram chat for disaster recovery; these copies are not deleted automatically.
+- Server logs contain your Telegram ID, the names of the commands and buttons you use and technical errors, but not the text of your messages. They are used only to find faults and are deleted automatically when the log size limit is reached, currently after about 2-3 weeks.
 
 ### Your rights
 
-- `/forget` deletes all your data at once (daily backups expire within 7 days).
+- `/forget` deletes all your data at once (daily backups expire within 7 days, logs as described above).
 - `/export` gives you your subscriptions with comments as a file.
 - On your personal request, all data the bot has stored about you can be fully erased.
 - For any question about your data, write to the contact above.
@@ -79,11 +80,12 @@ Changes to this policy are published in this file; its history is visible in the
 - Отправленные и отменённые уведомления: до 30 дней.
 - История статусов станций: до 90 дней.
 - Если вы заблокируете бота, ваши данные удалятся через 90 дней. Если вернётесь раньше, подписки восстановятся.
-- Ежедневные резервные копии базы хранятся 7 дней. Кроме того, владелец раз в неделю получает копию базы в личный чат Telegram на случай аварии.
+- Ежедневные резервные копии базы хранятся 7 дней. Кроме того, владелец раз в неделю получает копию базы в личный чат Telegram на случай аварии; эти копии автоматически не удаляются.
+- Журналы сервера содержат ваш Telegram ID, названия команд и кнопок, которыми вы пользуетесь, и технические ошибки, но не текст ваших сообщений. Они нужны только для поиска неполадок и удаляются автоматически при достижении лимита объёма, сейчас примерно через 2-3 недели.
 
 ### Ваши права
 
-- `/forget` сразу удаляет все ваши данные (из резервных копий они исчезнут в течение 7 дней).
+- `/forget` сразу удаляет все ваши данные (из ежедневных резервных копий они исчезнут в течение 7 дней, из журналов в срок, указанный выше).
 - `/export` выгружает ваши подписки с комментариями в файл.
 - По вашему личному запросу доступна полная очистка памяти бота от сохранённых данных о вас.
 - По любым вопросам о ваших данных пишите на контакты выше.

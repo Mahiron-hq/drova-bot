@@ -46,6 +46,7 @@ jobs:
           rustup target add x86_64-unknown-linux-musl
           pip install ziglang==0.17.1
           cargo install cargo-zigbuild --locked --version 0.24.1
+          cargo install cargo-about --locked --version 0.9.3 --features cli
       - name: Build and package
         run: |
           set -euo pipefail
@@ -55,6 +56,7 @@ jobs:
           mkdir -p "dist/$name"
           cp target/x86_64-unknown-linux-musl/release/drova-bot "dist/$name/"
           cp LICENSE README.md CHANGELOG.md PRIVACY.md "dist/$name/"
+          cargo about generate --locked about.hbs -o "dist/$name/THIRD-PARTY.txt"
           cp -r deploy "dist/$name/deploy"
           tar -C dist -czf "dist/$name.tar.gz" --owner=0 --group=0 --numeric-owner "$name"
           cd dist

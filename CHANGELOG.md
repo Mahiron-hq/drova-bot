@@ -25,6 +25,8 @@ The bot was rewritten from Python to Rust. Versions 1.x are the old Python bot, 
 - systemd watchdog, readiness and clean shutdown.
 - Test mode `ALLOWED_CHAT_IDS`.
 - `migrate-legacy` command that converts the database of the Python bot.
+- Several station links in one message are added at once, like an import.
+- Release archive includes `THIRD-PARTY.txt` with the licenses of the dependencies.
 
 ### Changed
 
@@ -37,6 +39,7 @@ The bot was rewritten from Python to Rust. Versions 1.x are the old Python bot, 
 - Messages use HTML formatting with escaping of all dynamic text.
 - Shorter command menu; old commands keep working.
 - Retention: sent notifications 30 days, station history 90 days.
+- Confirmation buttons of `/clear` and `/forget` work for 10 minutes.
 
 ### Fixed
 

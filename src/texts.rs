@@ -238,8 +238,9 @@ fn waiting_line(n: i64) -> String {
     format!("Ещё ждут освобождения: {}", users_count(n))
 }
 
-fn wait_note(s: Status) -> &'static str {
+fn wait_note(s: Status, published: bool, merchant: bool) -> &'static str {
     match s {
+        Status::Ready if !published && !merchant => "🔒 Свободна, но скрыта мерчантом",
         Status::Ready => "✅ Можно пользоваться",
         Status::Offline => "🔴 Станция недоступна, ждём возврата в онлайн",
         Status::Busy => "⏳ Ждём освобождения",
@@ -252,7 +253,7 @@ pub struct SubView<'a> {
     pub waiting: i64,
 }
 
-pub fn list(items: &[SubView<'_>], limit: i64, muted: bool, now: i64) -> String {
+pub fn list(items: &[SubView<'_>], limit: i64, muted: bool, merchant: bool, now: i64) -> String {
     let mut out = format!(
         "<b>Ваши подписки: {}/{limit}</b>\nРежим тишины: {}\n",
         items.len(),
@@ -285,7 +286,7 @@ pub fn list(items: &[SubView<'_>], limit: i64, muted: bool, now: i64) -> String 
             status_icon(st.status, st.published),
             html(&st.name),
             status_word(st.status),
-            wait_note(st.status)
+            wait_note(st.status, st.published, merchant)
         );
         if st.status != Status::Ready {
             let _ = write!(out, "\n{}", waiting_line(v.waiting));
@@ -1081,6 +1082,15 @@ pub fn unknown_state(raw: &str, name: &str) -> String {
     format!(
         "ℹ️ Drova вернула неизвестный статус станции: <code>{}</code> ({}). Он считается «недоступен».",
         html(raw),
+        html(name)
+    )
+}
+
+pub const BUTTON_EXPIRED: &str = "Кнопка устарела. Повторите команду.";
+
+pub fn published_missing(name: &str) -> String {
+    format!(
+        "ℹ️ Drova не прислала признак публикации станции ({}). Бот оставляет прежнее значение, у новых станций считает станцию открытой.",
         html(name)
     )
 }

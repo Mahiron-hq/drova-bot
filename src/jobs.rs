@@ -5,7 +5,7 @@ use anyhow::Result;
 use tokio::sync::watch;
 
 use crate::app::App;
-use crate::db::GONE_KEEP_DAYS;
+use crate::db::{GONE_KEEP_DAYS, Outgoing};
 use crate::keyboards as kb;
 use crate::texts;
 use crate::util::now;
@@ -63,7 +63,7 @@ pub async fn run(app: Arc<App>, mut shutdown: watch::Receiver<bool>) {
 }
 
 async fn expired_mutes(app: &App) -> Result<()> {
-    let users = app.db.take_expired_mutes(now()).await?;
+    let users = app.db.expired_mutes(now()).await?;
     if users.is_empty() {
         return Ok(());
     }
@@ -72,48 +72,57 @@ async fn expired_mutes(app: &App) -> Result<()> {
         let Some(u) = app.db.user(id).await? else {
             continue;
         };
-        let Some(status) = app.status_text(&u).await? else {
-            continue;
+        let report = match app.status_text(&u).await? {
+            Some(status) => Some(Outgoing::new(
+                "unmute_report",
+                id,
+                None,
+                texts::unmuted_report(&status),
+                Some(&kb::status()),
+            )?),
+            None => None,
         };
-        app.enqueue(
-            "unmute_report",
-            id,
-            None,
-            &texts::unmuted_report(&status),
-            Some(&kb::status()),
-        )
-        .await?;
+        app.db.end_mute(id, now(), report.as_ref()).await?;
     }
     app.wake_queue();
     Ok(())
 }
 
 async fn expired_gone(app: &App) -> Result<()> {
-    let subs = app
-        .db
-        .take_expired_gone(now() - GONE_KEEP_DAYS * 86_400)
-        .await?;
+    let cutoff = now() - GONE_KEEP_DAYS * 86_400;
+    let subs = app.db.expired_gone_subs(cutoff).await?;
     if subs.is_empty() {
         return Ok(());
     }
-    tracing::info!(
-        count = subs.len(),
-        "subscriptions to deleted stations removed"
-    );
+    let mut removed = 0;
     for s in subs {
-        if app
+        let active = app
             .db
             .user(s.user_id)
             .await?
-            .is_none_or(|u| u.blocked_at.is_some())
-        {
-            continue;
-        }
+            .is_some_and(|u| u.blocked_at.is_none());
         let st = &s.station;
-        let text = texts::gone_unsubscribed(&st.name, &st.uuid, s.comment.as_deref());
-        app.enqueue("gone_unsub", s.user_id, Some(&st.uuid), &text, None)
-            .await?;
+        let notice = if active {
+            let text = texts::gone_unsubscribed(&st.name, &st.uuid, s.comment.as_deref());
+            Some(Outgoing::new(
+                "gone_unsub",
+                s.user_id,
+                Some(&st.uuid),
+                text,
+                None,
+            )?)
+        } else {
+            None
+        };
+        if app
+            .db
+            .remove_gone_sub(s.id, cutoff, notice.as_ref(), now())
+            .await?
+        {
+            removed += 1;
+        }
     }
+    tracing::info!(removed, "subscriptions to deleted stations removed");
     app.wake_queue();
     Ok(())
 }
@@ -129,12 +138,16 @@ async fn weekly(app: &App) -> Result<()> {
     if t < due || t - due > WEEKLY_CATCH_UP {
         return Ok(());
     }
-    if !app.db.create_campaign("weekly", due, t).await? {
+    if app.db.campaign_exists("weekly", due).await? {
         return Ok(());
     }
     let targets = app.db.weekly_targets(t).await?;
-    for id in &targets {
-        app.enqueue("weekly", *id, None, text, None).await?;
+    let msgs = targets
+        .iter()
+        .map(|id| Outgoing::new("weekly", *id, None, text, None))
+        .collect::<Result<Vec<_>>>()?;
+    if !app.db.start_campaign("weekly", due, t, &msgs).await? {
+        return Ok(());
     }
     tracing::info!(count = targets.len(), "weekly reminder queued");
     app.wake_queue();

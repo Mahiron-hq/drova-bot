@@ -37,6 +37,9 @@ pub struct Document {
 #[allow(clippy::struct_field_names)]
 pub struct Message {
     pub message_id: i64,
+    /// Zero for an inaccessible message.
+    #[serde(default)]
+    pub date: i64,
     pub from: Option<User>,
     pub chat: Chat,
     pub text: Option<String>,
